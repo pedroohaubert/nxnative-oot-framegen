@@ -1,3 +1,47 @@
+# nxnative-oot-framegen
+
+> **What this repository is:** my personal mix of the **latest [nxnative](https://github.com/seedds/nxnative)** engine with the **frame generation** (and the rest of the Ocarina of Time work) from **[kid-with-sword-remake](https://github.com/cheemu21/kid-with-sword-remake)**, aimed at playing *The Legend of Zelda: Ocarina of Time* (Switch 2) as a native **Mac** app. The frame generation is not mine: it was taken from kid-with-sword-remake, with full credit below. Both projects are MIT, and so is this one.
+
+## What comes from where
+
+| Part | From |
+|---|---|
+| Engine: NVN on Metal, Horizon host, shader translator, pipeline archive, memory and frame pacing | [seedds/nxnative](https://github.com/seedds/nxnative) `main` at `e4b0d9b7` (2026-11-18) |
+| Frame generation: the game draws 30 fps, MetalFX's frame interpolator shows 60 | [cheemu21/kid-with-sword-remake](https://github.com/cheemu21/kid-with-sword-remake) `L6.6` (`e2869c41`) |
+| MetalFX for the game's own upscaler, Wide view, the launcher, the microphone ocarina, amiibo, the Ocarina of Time prewarm and layout lists | kid-with-sword-remake |
+| The merge itself, and a few fixes found while reviewing it | this repository |
+
+What the newer nxnative brings on top of kid-with-sword-remake L6.6 (117 upstream commits): memory freed between Hyrule Field and Kakariko, pipeline lookups moved off the game's thread (fewer stutters), an archive that survives a crash of Apple's shader compiler, a larger prewarm list, a lower-latency display link at 60 fps, and cheaper pool tables and occlusion queries.
+
+Fixes made here:
+- The merge keeps kid-with-sword's frame generation working beside nxnative's late latch on the display link (they never run together).
+- The Mac app now packs `layout_bases.tsv`, so the ~3,400 vertex-layout pipelines it ships are actually used instead of compiled while you play (already missing in kid-with-sword-remake).
+- `pso_offline.py` rebuilds its archive when only `pso_layouts.tsv` changes; `DM_PSO_CAPTURE` runs after the compiler-crash check.
+
+**Status:** builds, and passes the host, graphics, frame-generation and display-link tests on a Mac mini M4 (16 GB, macOS 27.2.1, Xcode 27.2). Not play-tested yet. iPhone builds were not tested. Nothing from any game is in this repository: you build the app yourself from your own dump.
+
+## How to play
+
+Build the Mac app yourself. Requirements as in nxnative: Apple silicon, macOS 26.6+, Xcode 27.2 (`sudo xcode-select -s /Applications/Xcode.app`, `xcodebuild -downloadComponent MetalToolchain`), Homebrew (`brew install xcodegen zstd glslang`), and Python 3.12+ with `lz4 "capstone>=5,<6" fonttools nsz zbic`.
+
+```
+git clone https://github.com/pedroohaubert/nxnative-oot-framegen.git && cd nxnative-oot-framegen
+printf 'DM_UPSCALER=metalfx\n' > oot.env
+python3 scripts/build_ipa_from_nsp.py "<your .nup or dump folder>" --platform mac-app --env-file oot.env -o ~/Desktop/"Zelda OoT.app"
+```
+
+The first build takes one to two hours (about 43,000 shaders); the first start prepares pipelines for a few minutes. In the launcher, try **Frame Rate 30 + Frame Generation**, **Docked**, **Dynamic Resolution off**, and compare with plain 30 fps.
+
+## Credits
+
+- **Frame generation, and the Ocarina of Time port work it builds on:** [kid-with-sword-remake](https://github.com/cheemu21/kid-with-sword-remake) by cheemu21 and its contributors (listed in its README below); its idea of frame generation for Ocarina of Time came from [Hookshot](https://github.com/NotRexed/Hookshot).
+- **Engine:** [nxnative](https://github.com/seedds/nxnative) by seedds and its contributors.
+- Not affiliated with Nintendo, nxnative or kid-with-sword-remake. Questions about this mix go to this repository's issues, not to theirs.
+
+---
+
+*The original kid-with-sword-remake README follows.*
+
 <p align="center">
   <img src="docs/images/kid-with-sword-remake-icon.png" width="160" alt="Kid with Sword Remake app icon: a snow-leopard cat dressed as Link">
 </p>
