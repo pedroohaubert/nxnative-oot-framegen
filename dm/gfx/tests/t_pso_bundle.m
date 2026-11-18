@@ -251,7 +251,7 @@ int main(void) { @autoreleasepool {
         EXPECT("layouts: layout_bases.tsv counts the base", 1, nl.intValue);
         id<MTL4Archive> real = g_arch_bundle; int real_l = g_bundle_layouts; NSArray *r4 = g_arch4, *r4p = g_arch4p;
         NSMutableArray *list = [NSMutableArray array]; g_arch_bundle = nil; g_bundle_layouts = 0;
-        setenv("DM_PSO_BUNDLE", b2.UTF8String, 1); pso_bundle_open(list);
+        setenv("DM_PSO_BUNDLE", b2.UTF8String, 1); pso_bundle_open(list, arch_plan(nil));
         EXPECT("layouts: the bundle opened and says it holds bases with a layout", 1, g_arch_bundle != nil && g_bundle_layouts == 1);
         g_arch4 = @[]; g_arch4p = list;
         NSError *le = nil;

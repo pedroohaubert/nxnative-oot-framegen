@@ -10286,14 +10286,6 @@ static void arch_write(ArchEpoch *ep) {
 static void arch_write_file(ArchEpoch *ep) {
     int n = atomic_load(&ep->n), vd = atomic_load(&ep->vd), cs = atomic_load(&ep->cs), ms = atomic_load(&ep->ms);   // exact: no compile of the period is under way
     if (!n) return;
-    if (pso_capture_dir()) {   // DM_PSO_CAPTURE: the period's descriptors as a pipelines script, no archive file
-        NSError *se = nil; NSData *js = [ep->ser serializeAsPipelinesScriptWithError:&se];
-        NSString *sp = [pso_capture_dir() stringByAppendingPathComponent:[NSString stringWithFormat:@"%05d-%d.mtl4-json", g_arch_seq++, n]];
-        if (!js || ![js writeToFile:sp atomically:YES]) MLOG("[RED] DM_PSO_CAPTURE: writing %s failed%s%s", sp.UTF8String, se ? ": " : "", se ? se.localizedDescription.UTF8String : "");
-        else MLOG("DM_PSO_CAPTURE: %d pipelines' descriptors written to %s (%.1f MB)", n, sp.UTF8String, js.length / 1048576.0);
-        atomic_fetch_sub(&g_arch_new, n); atomic_fetch_sub(&g_arch_new_vd, vd);
-        return;
-    }
     int plain = ser_begin();   // a plain compile may report service death only after Metal's retries: an expired wait cannot certify this period
     int crashed = atomic_load(&ep->crashed) || ep->deaths != atomic_load(&g_arch_deaths);
     if (crashed || plain) {
@@ -10304,6 +10296,14 @@ static void arch_write_file(ArchEpoch *ep) {
                           n, n - cs - ms, cs, ms);
         else MLOG("pipeline archive: a flush period with %d unfinished plain compiles is not written (%d pipelines); their errors are not known yet, the pipelines are captured again at a later start", plain, n);
         return;
+    }
+    if (pso_capture_dir()) {   // DM_PSO_CAPTURE: the period's descriptors as a pipelines script, no archive file; under ser_begin and after the compiler-death check, as a write
+        NSError *se = nil; NSData *js = [ep->ser serializeAsPipelinesScriptWithError:&se];
+        NSString *sp = [pso_capture_dir() stringByAppendingPathComponent:[NSString stringWithFormat:@"%05d-%d.mtl4-json", g_arch_seq++, n]];
+        if (!js || ![js writeToFile:sp atomically:YES]) MLOG("[RED] DM_PSO_CAPTURE: writing %s failed%s%s", sp.UTF8String, se ? ": " : "", se ? se.localizedDescription.UTF8String : "");
+        else MLOG("DM_PSO_CAPTURE: %d pipelines' descriptors written to %s (%.1f MB)", n, sp.UTF8String, js.length / 1048576.0);
+        atomic_fetch_sub(&g_arch_new, n); atomic_fetch_sub(&g_arch_new_vd, vd);
+        ser_end(); return;
     }
     [NSFileManager.defaultManager createDirectoryAtPath:g_arch_dir withIntermediateDirectories:YES attributes:nil error:nil];
     uint64_t t0 = bp_now(); NSError *e = nil;

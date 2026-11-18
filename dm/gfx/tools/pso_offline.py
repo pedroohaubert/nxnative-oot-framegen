@@ -310,6 +310,7 @@ def run_key(a, archs, text, osmin):
     # Replacement and same-sized writes can preserve mtime. As in romfs._resolve, inode and ctime make those go through the content-based archive_key instead of reusing stale GPU code.
     inputs = {'format': 2, 'image': [os.path.realpath(image), st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns], 'pairs': hashlib.sha256(text).hexdigest(),
               'computes': None if a.no_compute else read_computes(a.shader_map, a.manifest), 'depth': a.depth, 'archs': archs, 'platform': a.platform, 'os_min': osmin, 'toolchain': tv,
+              'layouts': [[str(f), hashlib.sha256(Path(f).read_bytes()).hexdigest()] for f in (a.layouts or []) if os.path.isfile(f)],
               'batch': a.batch_size, 'code': [[os.path.relpath(f, here), hashlib.sha256(Path(f).read_bytes()).hexdigest()] for f in code]}
     return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
 
@@ -928,7 +929,7 @@ def main(argv=None):
     prewarm = update_prewarm(a, lib_dir, out, work, gpus, zero)
     lb = out / 'layout_bases.tsv'   # the host asks the bundle for bases with a vertex layout only when this names some (nvn_mtl.m g_bundle_layouts)
     fset = set(failed_bases); nl = len([b for b in layouts if b not in fset]) if archs else 0
-    if nl: lb.write_text(f'{nl}\n')
+    if nl: write_changed(lb, f'{nl}\n')
     else: lb.unlink(missing_ok=True)
     rest = list(dict.fromkeys([*rest, *map(pair_of, (b for b in failed_bases if len(b) == 4))]))   # the pairs the device still builds: those with function constants, then those metal-tt failed on (a base with a vertex layout metal-tt failed on is the device's at its draw, not a pair's prebuild)
     rp = out / 'rest_pairs.tsv'
