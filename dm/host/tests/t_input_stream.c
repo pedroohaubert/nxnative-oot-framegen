@@ -15,6 +15,7 @@ void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
 int dm_guest_as_contains(uintptr_t a) { (void)a; return 0; }
 void dm_host_helper_qos(qos_class_t q) { (void)q; }
+void dm_audio_device_changed(void) {}   // renderer notification delivery is checked by t_audren_work
 
 static uint64_t f_head; static int f_users, f_retains, f_on = 1;
 int dm_mic_available(void) { return f_on; }
