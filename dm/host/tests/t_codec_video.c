@@ -94,6 +94,19 @@ static const uint8_t vp9[] = {
     0xff,0xff,0xff,0xf2,0x2a,0xc0,0x00,
 };
 
+// Whether VideoToolbox decodes AV1 in this process. VTIsHardwareDecodeSupported answers for the system, and a machine can answer yes and then refuse the session
+// (-12906: GitHub's xcode-27 runner does, and the host falls back to dav1d). Every case below drives VideoToolbox's own session, so they ask by opening one and
+// looking at the decoder the host ended with, not by what the system advertises.
+static int vt_av1_here(void) {
+    static int v = -1; if (v >= 0) return v;
+    v = 0;
+    if (VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)) {
+        mav1 *a = mav1_new(NULL); mav1_picture pic;
+        mav1_decode(a, av1, sizeof av1, 0, &pic);
+        v = a->vs && !a->soft; mav1_free(a);
+    }
+    return v;
+}
 // Real VideoToolbox sessions invalidated between packets, as can happen while
 // iOS takes the app out of focus. The decoder must still return every picture.
 static void vt_session_lifecycle(void) {
@@ -105,14 +118,14 @@ static void vt_session_lifecycle(void) {
         while (mavc_take(c, 1, nv12, 64, 64, &pts)) avc_pictures++;
     }
     mavc_free(c);
-    if (VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)) {
+    if (vt_av1_here()) {
         mav1 *a = mav1_new(NULL); mav1_picture pic; av1_pictures = 0;
         for (int i = 0; i < 3; i++) {
             if (i == 1) { assert(a->vs && !a->soft); VTDecompressionSessionInvalidate(a->vs); }
             if (mav1_decode(a, av1, sizeof av1, i * 1000, &pic) == 1) av1_pictures++;
         }
         mav1_free(a);
-    } else puts("VideoToolbox lifecycle: hardware AV1 unavailable; AV1 case skipped");
+    } else puts("VideoToolbox lifecycle: this machine offers no VideoToolbox AV1 session; AV1 case skipped");
     printf("invalidated VideoToolbox sessions: H.264 %d/3 pictures, AV1 %d/3 pictures\n", avc_pictures, av1_pictures);
     fflush(stdout);
     assert(avc_pictures == 3 && av1_pictures == 3);
@@ -150,7 +163,7 @@ static void vt_reference_recovery(void) {
             got++;
         }
         assert(got == 36); mavc_drop(c); assert(!c->history.count); mavc_free(c);
-        if (!VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)) continue;
+        if (!vt_av1_here()) continue;
         mav1 *a = mav1_new(NULL); mav1_picture pic; got = 0;
         for (int loop = 0; loop < 3; loop++) for (int i = 0; i < 12; i++) {
             if ((loss < 12 ? loss : 7) == i && a->vs) {
@@ -180,7 +193,7 @@ static void vt_av1_random_access(void) {
 }
 static void vt_worker_lifecycle(void) {
     for (int codec = CV_H264; codec <= CV_AV1; codec++) {
-        if (codec == CV_AV1 && !VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)) continue;
+        if (codec == CV_AV1 && !vt_av1_here()) continue;
         for (int action = 0; action < 4; action++) {
             _Alignas(16) uint8_t dec[0x400] = {0}; uint64_t id;
             const uint8_t *packet = codec == CV_H264 ? h264 : av1;
@@ -399,7 +412,7 @@ int main(void) {
         size_t seqn = 0; assert(find_seq(obu, (bit + 7) / 8, &seqn) == obu && seqn == (bit + 7) / 8);
         assert(!mav1_av1c(delimiter, sizeof delimiter, c, &aw, &ah) && !find_seq(delimiter, sizeof delimiter, &seqn));
         // The red frame on each backend this Mac has (VideoToolbox where the chip decodes AV1, and dav1d, which DM_AV1_DAV1D=1 picks), as NV12: Y 81, Cb 90, Cr 240 (BT.601, video range)
-        for (int soft = VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) ? 0 : 1; soft < 2; soft++) {
+        for (int soft = vt_av1_here() ? 0 : 1; soft < 2; soft++) {
             setenv("DM_AV1_DAV1D", soft ? "1" : "0", 1);
             mav1 *a = mav1_new(NULL); assert(!strcmp(mav1_backend(a), soft ? "dav1d" : "VideoToolbox"));
             // dav1d decodes several frames at once: a unit's picture comes with that unit's time, at once or when the frames in flight are asked for (mav1_next's drain).
