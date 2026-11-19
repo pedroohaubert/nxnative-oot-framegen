@@ -320,6 +320,7 @@ static void u_pass_at(int band, const int hud[4], int dt, const tex_t *t, int k)
         p_clear_color cc = {.index = 0, .mask = 15, .rgba = {0.16f, 0.16f, 0.2f, 1}}; u_emit(OP_CLEAR_COLOR, &cc, sizeof cc); }
     ds_st ds = {.dt = dt != 0, .dw = dt != 0, .df = NVN_DEPTH_FUNC_ALWAYS};
     p_bind_state bs = {.kind = 5}; memcpy(bs.bytes, &ds, sizeof ds); u_emit(OP_BIND_STATE, &bs, sizeof bs);
+    if (band < 0 && !hud) return;
     p_scissor sc = band >= 0 ? (p_scissor){band / k, 76 / k, 40 / k, 44 / k} : (p_scissor){hud[0] / k, hud[1] / k, hud[2] / k, hud[3] / k};
     u_emit(OP_SCISSOR, &sc, sizeof sc);
     p_draw d = {.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = 3, .instances = 1}; u_emit(OP_DRAW, &d, sizeof d);
@@ -356,10 +357,11 @@ static int u_present(const int crop[4]) {   // present the picture the passes dr
     return last_slot();
 }
 static float *u_mask(int *bw, int *bh) {   // the mask's blocks, R16Float, as floats (its grid, which follows the generated frame's size)
-    *bw = (int)g_fg_ui.width; *bh = (int)g_fg_ui.height; long n = (long)*bw * *bh;
+    id<MTLTexture> ui = g_fg_ui; if (!ui) exit(2);
+    *bw = (int)ui.width; *bh = (int)ui.height; long n = (long)*bw * *bh;
     id<MTLBuffer> out = [g_dev newBufferWithLength:n * 2 options:MTLResourceStorageModeShared]; if (!out) exit(2);
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-    [b copyFromTexture:g_fg_ui sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(*bw, *bh, 1) toBuffer:out destinationOffset:0
+    [b copyFromTexture:ui sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(*bw, *bh, 1) toBuffer:out destinationOffset:0
         destinationBytesPerRow:*bw * 2 destinationBytesPerImage:n * 2];
     [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
     float *m = malloc(n * sizeof *m); const uint16_t *h = out.contents;

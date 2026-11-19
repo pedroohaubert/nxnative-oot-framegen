@@ -19818,7 +19818,7 @@ static void fg_ui_reap(void) {
     }
     pthread_mutex_unlock(&g_ui_mu);
     if (nd && g_snap_res) {
-        for (int i = 0; i < nd; i++) [g_snap_res removeAllocation:drop[i]];
+        for (int i = 0; i < nd; i++) if (drop[i]) [g_snap_res removeAllocation:drop[i]];
         [g_snap_res commit];
     }
 }
@@ -19905,7 +19905,7 @@ void fg_ui_pass_begin(id<MTLTexture> mt, uint64_t pass) {
         pthread_mutex_lock(&g_ui_mu); g_ui_ref_pass = (int)pass; g_fg_ui_tgt = mt; pthread_mutex_unlock(&g_ui_mu);
         return;
     }
-    int cached = 0; for (int i = 0; i < g_ui_cache_n; i++) if (g_ui_cache[i].serial == rt->color[0]->serial && g_ui_cache[i].w == (int)mt.width && g_ui_cache[i].h == (int)mt.height) cached = 1;
+    int cached = 0; for (int i = 0; i < g_ui_cache_n && i < 2; i++) if (g_ui_cache[i].serial == rt->color[0]->serial && g_ui_cache[i].w == (int)mt.width && g_ui_cache[i].h == (int)mt.height) cached = 1;
     if (!cached && g_ui_copies >= FG_UI_COPIES) return;
     if (!fg_ui_pic(mt)) return;
     {   // the copy, in the replay stream: everything drawn into the picture before this pass has landed by the encoder's own barrier
@@ -19943,7 +19943,7 @@ void fg_ui_pass_end(uint64_t pass) {
     pthread_mutex_unlock(&g_ui_mu);
     // The last two targets, by serial and size: a target that steps size between frames (the dynamic resolution) is not the cached one, and is learned again
     int same = 0;
-    for (int i = 0; i < g_ui_cache_n && !same; i++) same = g_ui_cache[i].serial == g_ui_copy_ser && g_ui_cache[i].w == g_ui_copy_w && g_ui_cache[i].h == g_ui_copy_h;
+    for (int i = 0; i < g_ui_cache_n && i < 2 && !same; i++) same = g_ui_cache[i].serial == g_ui_copy_ser && g_ui_cache[i].w == g_ui_copy_w && g_ui_cache[i].h == g_ui_copy_h;
     if (!same) {
         if (g_ui_cache_n < 2) { g_ui_cache[g_ui_cache_n].serial = g_ui_copy_ser; g_ui_cache[g_ui_cache_n].w = g_ui_copy_w; g_ui_cache[g_ui_cache_n].h = g_ui_copy_h; g_ui_cache_n++; }
         else { g_ui_cache[0] = g_ui_cache[1]; g_ui_cache[1] = (typeof(g_ui_cache[1])){.serial = g_ui_copy_ser, .w = g_ui_copy_w, .h = g_ui_copy_h}; }
