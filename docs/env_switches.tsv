@@ -274,6 +274,8 @@ DM_NVN_TEXDUMP	diagnostic	`=<frame>:<path>`, `size=<W>x<H>:<path>` or `layers=<n
 DM_NVN_TEXINFO	diagnostic	`=<W>x<H>` logs storage and description of every texture of that size on first use, registration and initialization (pool, flags, packaged, non-zero bytes, swizzles)
 DM_NVN_TEXRAW	diagnostic	`=<serial>,…` or `info` (the textures `DM_NVN_TEXINFO` picked out): saves those textures' raw bytes at the `DM_NVN_TEXDUMP` frame, with a text header line
 DM_NVN_TEXSNAP	diagnostic	`=<in-frame pass index>,…`: with `DM_NVN_TEXDUMP`, copies those passes' colour attachments as they end and saves them with the end-of-frame dump
+DM_NVN_TEX_MIP_LEVELS	player	With `DM_NVN_TEX_MIP_SKIP`, how many finest levels to leave out, `1` (default) to `3`; at least one level is kept
+DM_NVN_TEX_MIP_SKIP	player	`=<pixels>` (`1` = 512): CPU-written compressed 2D, array and cube textures at least that size on their shorter side are made without their finest level(s) (`DM_NVN_TEX_MIP_LEVELS`): about a quarter of their memory and of their upload; render targets and shader-written textures are unchanged; `0` or unset keeps every level (the launcher's Texture Memory Saver; on by default on iPhone)
 DM_NVN_TF_CPU	switch	`0` sends every transform feedback capture through the `tf_prepare` dispatch in a render pass of its own, as before; by default the capture state is kept on the CPU from a begin until a resume or a geometry capture takes it from the GPU, and captures that follow each other share one pass, behind barriers inside it where one may touch what another read or wrote
 DM_NVN_TREG_ID	diagnostic	`=<n>` logs every registration of texture ID n: what it holds from then on, and the frame being recorded
 DM_NVN_TSV	diagnostic	`=<path>` writes the per-frame NVN call table and timing rows (frame, metric, value) to a TSV, read by `scripts/bench.py`
@@ -290,6 +292,7 @@ DM_NVN_UB_PARTIAL	switch	`0`: a uniform block the deferred updates cover only in
 DM_NVN_UNBIND_DEFER	switch	`0` makes an empty `SetRenderTargets` end the open render pass again; by default the unbind is deferred, so a following binding of the same targets continues the pass (`nvn_mtl.m` `unb_on`, on by default)
 DM_NVN_UNWRITTEN_DC	switch	`0` disables optional stores elided for loaded, unchanged attachments (on by default, independent of TBDR lookahead), for equivalence comparisons; mandatory image-write preservation stays active
 DM_NVN_UPLOAD_REUSE	switch	0 keeps the original one-block upload-slot policy; default retains bounded demand-sized primary and overflow buffers after completion.
+DM_NVN_UP_BATCH_MB	switch	`=<MB>` (16 to 512): an upload batch is committed once its staging and the guest memory its uploads read through their own source buffers reach this much (default 48 on iOS, 128 on the Mac); a player may set it in Documents/env.txt
 DM_NVN_VBUF_CACHE	switch	`0` turns off the cache of resolved vertex stream addresses and vertex argument table writes across draws (on by default), for A/B runs
 DM_NVN_VCONV_CHECK	diagnostic	`=1` scans the indices again at every reuse of a cached vertex conversion range (`vconv_range`) and reports differences
 DM_NVN_VCONV_CPU	switch	`=1` converts on the CPU every vertex attribute Metal's fetch cannot read, as before, instead of through the shader's shadow inputs (`<key>_bv`) or its pulling entry (`<key>_bp`)

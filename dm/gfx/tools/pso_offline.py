@@ -339,7 +339,7 @@ def library_digest(lib_dir, bases, computes=()):
         with romfs.open(os.path.join(lib_dir, f'{name}.metallib'), 'rb') as f:
             while chunk := f.read(1 << 20): lib.update(chunk)
         return lib.digest()
-    names = sorted({lib for b in bases for lib in (b[0], b[2])} | {lib for lib, _ in computes})
+    names = sorted({lib for b in bases for lib in (b[0], b[2])} | {lib for lib, _ in computes})   # a base with a vertex layout has a fifth member (read_layouts)
     h = hashlib.sha256()
     with concurrent.futures.ThreadPoolExecutor(8) as pool:   # the libraries read and hashed on a few threads, their digests taken in order: the same key
         for name, d in zip(names, pool.map(digest, names)): h.update(name.encode() + b'\0'); h.update(d)
