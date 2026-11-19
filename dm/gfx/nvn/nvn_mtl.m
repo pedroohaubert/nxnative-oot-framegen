@@ -9753,7 +9753,7 @@ static uint64_t arch_file_size(NSString *path, arch_reads *rd) {   // validated 
 // extra space but the one block the magic is written to), made once per bundled file (pso_bundle/<gpu>.stamp: its size and modification time). Without a clone (another volume,
 // no APFS) it is left out rather than copied whole: the bases are then built on the device, as with no archive. Returns the archive's path, or nil
 static NSString *pso_bundle_unwrap(NSString *dir, NSString *gpu) {
-    NSString *src = [dir stringByAppendingPathComponent:[gpu stringByAppendingPathExtension:@"mtl4x"]], *user = pso_user_path();
+    NSString *src = [dir stringByAppendingPathComponent:[gpu stringByAppendingPathExtension:@"mtl4x"]], *user = pso_user_path();   // NOLINT(clang-analyzer-nullability.NullablePassedToNonnull): gpu is the device's name, never nil, and the SDK annotates stringByAppendingPathExtension: nullable because it answers nil for a nil receiver
     struct stat ss; if (!user || stat(src.fileSystemRepresentation, &ss)) return nil;
     NSString *out = [user.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_bundle"];
     NSString *dst = [out stringByAppendingPathComponent:[gpu stringByAppendingPathExtension:@"mtl4a"]], *stp = [out stringByAppendingPathComponent:[gpu stringByAppendingPathExtension:@"stamp"]];
@@ -19924,7 +19924,7 @@ static void fg_encode(id<MTL4CommandBuffer> cb, int k, int pk, double period) {
     id<MTL4FXFrameInterpolator> fi = fg_for(col);
     if (!fi) return;
     int follows = prev && g_snap[pk].seq + 1 == g_snap[k].seq && prev.width == col.width && prev.height == col.height && prev.pixelFormat == col.pixelFormat;
-    int mv = fg_mv_on() && g_fg_tiles && g_snap[k].lum && g_snap[pk].lum && g_snap[k].lum.width == g_snap[pk].lum.width && g_snap[k].lum.height == g_snap[pk].lum.height;
+    int mv = pk >= 0 && fg_mv_on() && g_fg_tiles && g_snap[k].lum && g_snap[pk].lum && g_snap[k].lum.width == g_snap[pk].lum.width && g_snap[k].lum.height == g_snap[pk].lum.height;
     int keep = mv && fg_keep_fmt(col.pixelFormat);
     if (!follows) {   // nothing to generate from: the history starts again with this present (the next one interpolates from it)
         if (g_fg_warm) g_fg_resets++;

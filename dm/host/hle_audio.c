@@ -940,7 +940,7 @@ HLE_FORCE("_ZN2nn5audio15ReadInputStreamEPNS0_15InputStreamTypeEPvi", "the micro
         int k = dm_mic_copy(s->cur, tmp, n - done < 512 ? n - done : 512); if (k <= 0) break;
         for (int i = 0; i < k; i++) {
             int v = gain == 1.0f ? tmp[i] : (int)(tmp[i] * gain); v = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
-            for (int c = 0; c < ch; c++) buf[(done + i) * ch + c] = (int16_t)v;
+            for (int c = 0; c < ch; c++) buf[(done + i) * ch + c] = (int16_t)v;   // NOLINT(clang-analyzer-security.ArrayBound): buf is the caller's frames x ch span, and done + i < n <= frames
         }
         s->cur += (uint64_t)k; done += k;
     }

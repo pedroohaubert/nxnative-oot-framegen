@@ -36,7 +36,7 @@ static tex_t frame(int i) {   // present i: the moving square at square_x(i), th
 static void bright_d(id<MTLTexture> t, int d, int *lo, int *hi, int *still);
 static void bright(id<MTLTexture> t, int *lo, int *hi, int *still) { bright_d(t, 1, lo, hi, still); }
 static void bright_d(id<MTLTexture> t, int d, int *lo, int *hi, int *still) {
-    id<MTLBuffer> out = [g_dev newBufferWithLength:W * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [g_dev newBufferWithLength:W * 4 options:MTLResourceStorageModeShared]; if (!out) return;
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, (Y0 + SQ / 2) / d, 0) sourceSize:MTLSizeMake(W / d, 1, 1) toBuffer:out destinationOffset:0 destinationBytesPerRow:W * 4 destinationBytesPerImage:W * 4];
     [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
@@ -59,7 +59,7 @@ static uint64_t tick(void) {   // one 60 Hz tick of the display link; returns th
     TUpdate *u = [TUpdate new]; u.drawable = [g_test_layer nextDrawable]; u.targetPresentationTimestamp = g_t; g_t += 1 / 60.0;
     uint64_t n = g_present_n; g_present_ser = 0;
     uint64_t t0 = now_ns();
-    [[NvMetalDisplayLinkDelegate new] metalDisplayLink:(CAMetalDisplayLink *)nil needsUpdate:(CAMetalDisplayLinkUpdate *)u];
+    [[NvMetalDisplayLinkDelegate new] metalDisplayLink:(CAMetalDisplayLink *)nil needsUpdate:(CAMetalDisplayLinkUpdate *)u];   // NOLINT(clang-analyzer-nullability.NullPassedToNonnull): the delegate never reads its link, and a nil one is what the test poses
     g_tick_ms = (now_ns() - t0) / 1e6;
     return g_present_n != n ? g_present_ser : 0;
 }
@@ -120,7 +120,7 @@ static tex_t sb_tex(float ox, int i) {
     t.d.target = NVN_TEXTURE_TARGET_2D; t.d.format = NVN_FORMAT_RGBA8; serial_put(t.serial, mt); res_add(mt); res_commit(); return t;
 }
 static uint8_t *sb_read(id<MTLTexture> t) {
-    id<MTLBuffer> out = [g_dev newBufferWithLength:SW * SH * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [g_dev newBufferWithLength:SW * SH * 4 options:MTLResourceStorageModeShared]; if (!out) return NULL;
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(SW, SH, 1) toBuffer:out destinationOffset:0 destinationBytesPerRow:SW * 4 destinationBytesPerImage:SW * SH * 4];
     [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
@@ -164,7 +164,7 @@ static int stab_case(void) {
 int main(int argc, char **argv) { @autoreleasepool {
     if (argc > 1 && !strcmp(argv[1], "size")) return size_case();
     if (argc > 1 && !strcmp(argv[1], "stab")) return stab_case();
-    alarm(90); setbuf(stdout, NULL);
+    alarm(90); setvbuf(stdout, NULL, _IONBF, 0);
     setenv("DM_FRAMEGEN", "1", 1); setenv("DM_PRESENT_SNAP", "1", 1); setenv("DM_PRESENT_HZ", "0", 1); setenv("DM_PRESENT_LINK", "0", 1);   // the present thread first; the link's ticks are called below
     mtl_init();
     g_test_layer = [CAMetalLayer layer]; g_test_layer.device = g_dev; g_test_layer.drawableSize = CGSizeMake(W, H); g_test_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;

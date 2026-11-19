@@ -48,13 +48,14 @@ static int mic_start(void) {   // g_mu held
     AVAudioFormat *hw = [in outputFormatForBus:0];
     if (!hw || hw.sampleRate <= 0 || hw.channelCount == 0) { LOG("[RED] microphone: no input (the device has none, or the audio session cannot record)"); return 0; }
     g_out = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32 sampleRate:DM_MIC_RATE channels:1 interleaved:NO];
+    if (!g_out) { LOG("[RED] microphone: no 48 kHz mono format to convert into"); return 0; }
     g_conv = [[AVAudioConverter alloc] initFromFormat:hw toFormat:g_out];
     if (!g_conv) { LOG("[RED] microphone: no converter from %.0f Hz x%u to 48 kHz mono", hw.sampleRate, (unsigned)hw.channelCount); return 0; }
     AVAudioConverter *conv = g_conv; AVAudioFormat *out = g_out;
     [in installTapOnBus:0 bufferSize:1024 format:hw block:^(AVAudioPCMBuffer *buf, AVAudioTime *when) {
         (void)when;
         AVAudioFrameCount cap = (AVAudioFrameCount)((double)buf.frameLength * DM_MIC_RATE / hw.sampleRate) + 16;
-        AVAudioPCMBuffer *o = [[AVAudioPCMBuffer alloc] initWithPCMFormat:out frameCapacity:cap];
+        AVAudioPCMBuffer *o = [[AVAudioPCMBuffer alloc] initWithPCMFormat:out frameCapacity:cap]; if (!o) return;   // the tap's block: nothing to convert into, so the frames are dropped
         __block BOOL given = NO;
         NSError *err = nil;
         [conv convertToBuffer:o error:&err withInputFromBlock:^AVAudioBuffer *(AVAudioPacketCount count, AVAudioConverterInputStatus *status) {
