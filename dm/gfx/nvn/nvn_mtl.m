@@ -2947,7 +2947,7 @@ static BOOL obj_is_tex(id object) {
     return is_texture;
 }
 
-static int g_red_once[177];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+static int g_red_once[179];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
 #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -6005,6 +6005,12 @@ static int bcp_before(const tex_t *t, id<MTLTexture> m, tex_t *o); static void b
 // for a reason other than SET_RT
 static int g_unb; static p_set_rt g_unb_rt; static uint64_t g_unb_n;
 static int unb_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_UNBIND_DEFER"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_UNBIND_DEFER=0: unbinding the targets ends the pass"); } return v; }
+// Frame generation's UI mask: the game's own UI pass (the last one of the frame, drawn into the picture the present shows) is the frame's last colour pass opened
+// with load and no depth, so the picture before it and the picture presented differ by the UI alone. The copy of the former is taken here, as the pass opens, and
+// the pass is confirmed when it ends (fg_ui_pass_begin / fg_ui_pass_end, with the frame generation below). g_fg_ui_ds: a draw of the watched pass depth-tests.
+static void fg_ui_pass_begin(id<MTLTexture> mt, uint64_t pass);
+static void fg_ui_pass_end(uint64_t pass);
+static int g_fg_ui_ds, g_fg_ui_watch_pass;   // g_fg_ui_watch_pass: the pass being confirmed (0: none)
 static void rp_end_at(const char *fn, int line) { if (g_enc) { AP_B; geo_mesh_flush_pass(); PD("E %llu pass ends in %s:%d", g_stat_pass, fn, line);
     if (enc_label_on()) { static uint64_t lf = ~0ull, base; uint64_t f = atomic_load(&g_cur_frame); if (f != lf) { lf = f; base = g_stat_pass - 1; }   // Intra-frame serial: the same pass has the same name every frame, so the table can aggregate by name
         [(id)g_enc setLabel:[NSString stringWithFormat:@"p%02llu %dx%d %s d%d", (unsigned long long)(g_stat_pass - base), g_el_w, g_el_h, g_el_key[0] ? g_el_key : "-", g_el_draws]]; }
@@ -6014,6 +6020,7 @@ static void rp_end_at(const char *fn, int line) { if (g_enc) { AP_B; geo_mesh_fl
     if (g_nbcrt) bcrt_flush();   // blocks drawn into shadows go back into their compressed textures
     if (g_nrtm) rt_mirror_flush();
     if (g_nbcp) { bcp_flush(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; } }   // sides of compressed-alias pairs the pass wrote go into their other sides, after the shadows' blocks (bcrt_flush); the copy encoder is closed again, as rt_mirror_flush does
+    fg_ui_pass_end(g_stat_pass);   // the frame generation's UI pass, when this was the pass whose picture was copied and no draw of it depth-tested
     AP_E(0);
 }
     if (g_unb) { g_unb = 0; R.rt = g_unb_rt; }   // finalize the old attachments and queued mesh draws before applying the unbind
@@ -6415,6 +6422,7 @@ static void *rp_begin_ex_(int clear_only) {
       void ts_note(id pd, NSUInteger nc); ts_note(pd, (NSUInteger)R.rt.n);
       void ms_note(id pd, NSUInteger nc); ms_note(pd, (NSUInteger)R.rt.n); }
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }   // the copy encoder the shadows' blocks were moved in with (bcrt_attach)
+    if (!clear_only) fg_ui_pass_begin(pd.colorAttachments[0].texture, g_stat_pass + 1);   // could this be the game's UI pass? its picture is copied before any draw of it
     ser_gate();
     g_stat_pass++;   // gp_begin records this pass; match the attachment and draw dump labels
     g_enc = enc_r_begin_pass(pd);
@@ -16235,6 +16243,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
         if (g_enc_vis) { enc_r_visibility(en, MTLVisibilityResultModeDisabled, 0); g_enc_vis = 0; } }
     g_stat_draw++;
     if (enc_label_on() && !g_el_draws++ && pr->sh[1]) { memcpy(g_el_key, pr->sh[1]->key, 8); g_el_key[8] = 0; }
+    if (g_fg_ui_watch_pass && (S.ds.dt || S.ds.dw)) g_fg_ui_ds = 1;   // a depth test or write: this pass is not the game's UI one (fg_ui_pass_end)
     if (passdump()) {   // Characteristics of a render pass's first draw (to judge whether the load can be omitted: full screen, no blending, writes all channels, does not depend on depth); with DM_NVN_PASSDUMP_ALL every draw is recorded
         static uint64_t last_pass = ~0ull; static int all = -1; if (all < 0) all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
         if (all || g_kd_force) PD("d %llu bv=%d bi=%d first=%d vs=%s fs=%s vc=%d inst=%d blend=%#x b0=%#llx dt=%d dw=%d df=%d cull=%d st=%d sf=%d,%d sop=%d,%d,%d/%d,%d,%d smask=%#x,%#x/%#x,%#x sref=%#x,%#x ib=%#llx it=%d cmask=%#x b1=%#llx b2=%#llx b3=%#llx po=%d/%g,%g,%g dc=%d", g_stat_pass, di ? di->base_vertex : 0, di ? di->base_instance : 0, dw ? dw->first : 0, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
@@ -19661,9 +19670,9 @@ static int fg_on(void) {
     return g_fg_mode = v;
 }
 // DM_FRAMEGEN_MV (default 1): frame generation's motion from the presented pictures (fg_motion) and the still HUD kept (fg_keep); 0: no motion, as X6-X9
-static id<MTLComputePipelineState> g_fgmv_ps[9]; static id<MTL4ArgumentTable> g_fgmv_args; static int g_fgmv_ok = -1;
+static id<MTLComputePipelineState> g_fgmv_ps[11]; static id<MTL4ArgumentTable> g_fgmv_args; static int g_fgmv_ok = -1;
 static id<MTLBuffer> g_fg_sw; static id<MTLTexture> g_fg_flags;   // the cut guard's switch and fgmv_cut's flags
-enum { FGMV_LUMA, FGMV_SEARCH, FGMV_PICK, FGMV_CUT, FGMV_STILL, FGMV_HUD, FGMV_KEEP, FGMV_PSTILL, FGMV_CONF };
+enum { FGMV_LUMA, FGMV_SEARCH, FGMV_PICK, FGMV_CUT, FGMV_STILL, FGMV_HUD, FGMV_KEEP, FGMV_PSTILL, FGMV_CONF, FGMV_UIMASK, FGMV_UISUM };
 // DM_FRAMEGEN_CUT (default 1): a cut's two pictures are shown as they are drawn, not with a picture invented between them (fgmv_cut, fgmv_hud). Its switch
 // reaches the kernels as a bit of g_fg_sw, which the test flips to compare a pair with and without it; off, the generated frames are the ones before it
 static int g_fg_guard_cut = -1;
@@ -19679,17 +19688,17 @@ static int fg_mv_on(void) {
     const char *e = getenv("DM_FRAMEGEN_MV");
     if (e && atoi(e) <= 0) { MLOG("frame generation: no motion given to the interpolator (DM_FRAMEGEN_MV=0): its own flow finds it, up to about 64 px a frame"); return g_fgmv_ok = 0; }
     NSError *err = nil; id<MTLLibrary> lib = host_lib("fgmv", &err);
-    static const char *fn[9] = {"fgmv_luma", "fgmv_search", "fgmv_pick", "fgmv_cut", "fgmv_still", "fgmv_hud", "fgmv_keep", "fgmv_pstill", "fgmv_conf"};
+    static const char *fn[11] = {"fgmv_luma", "fgmv_search", "fgmv_pick", "fgmv_cut", "fgmv_still", "fgmv_hud", "fgmv_keep", "fgmv_pstill", "fgmv_conf", "fgmv_uimask", "fgmv_uisum"};
     // DM_FRAMEGEN_PASTE=1: blocks whose motion is not trusted take the present's own pixels whole (fgmv.metal FGMV_PASTE: off by default, squares that stepped at 30 fps on camera turns)
     const char *pe = getenv("DM_FRAMEGEN_PASTE"); bool paste = pe && atoi(pe) > 0;
     MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new]; [cv setConstantValue:&paste type:MTLDataTypeBool atIndex:0];
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < 11; i++) {
         id<MTLFunction> f = !lib ? nil : i == FGMV_HUD ? [lib newFunctionWithName:@(fn[i]) constantValues:cv error:&err] : [lib newFunctionWithName:@(fn[i])];
         g_fgmv_ps[i] = f ? [g_dev newComputePipelineStateWithFunction:f error:&err] : nil;
         if (!g_fgmv_ps[i]) { MLOG("[RED] frame generation: no %s pipeline (%s): the interpolator gets no motion, as X6-X9", fn[i], err.description.UTF8String); return g_fgmv_ok = 0; }
     }
     if (g_fgmv_ps[FGMV_SEARCH].maxTotalThreadsPerThreadgroup < 256) { MLOG("[RED] frame generation: the motion search needs 256 threads a group, this GPU gives %lu: no motion given", (unsigned long)g_fgmv_ps[FGMV_SEARCH].maxTotalThreadsPerThreadgroup); return g_fgmv_ok = 0; }
-    MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 5;   // fgmv_keep reads the motion at 4
+    MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 6;   // fgmv_keep reads the motion at 4 and the UI mask at 5
     ad.maxBufferBindCount = 1;   // the cut guard's switch, g_fg_sw
     g_fgmv_args = [g_dev newArgumentTableWithDescriptor:ad error:&err];
     if (!g_fgmv_args) { MLOG("[RED] frame generation: no argument table for the motion (%s): no motion given", err.description.UTF8String); return g_fgmv_ok = 0; }
@@ -19736,6 +19745,148 @@ static id<MTLTexture> g_fg_tiles, g_fg_still, g_fg_keep, g_fg_pmask, g_fg_conf; 
 static uint64_t g_fg_seq;   // presents that could be copied (present_enqueue), for g_snap[].seq
 static int g_fg_warm;   // interpolations since the history last started again
 static uint64_t g_fg_made, g_fg_resets;
+// ---------- The UI mask (DM_FRAMEGEN_UI) ----------
+// Ocarina of Time's last pass draws the HUD into the picture the present shows, opened with load and no depth (HAU-4). The picture as that pass opened and the
+// picture presented differ by the UI alone, so the difference says which blocks of the generated frame must be the present's own: the dialogue text and the
+// hearts come out at the rate the game draws them, over a world still interpolated, where fgmv_still's guess fails (a HUD that changes between two presents is
+// not still). The pass is found from what its attachments are, confirmed by its draws, and used only when the present shows exactly that picture, 1:1; a game
+// without such a pass gets zeros and the frames of before. Cost: two copies of the picture and one kernel a frame, about 0.23 ms at 1920x1080.
+static int g_fg_ui_mode = -1;   // DM_FRAMEGEN_UI (default 1); read where a present is taken, so a copy in the replay has something to say first (g_fg_ui_mode != 1)
+static int fg_ui_on(void) {
+    if (g_fg_ui_mode < 0) {
+        const char *e = getenv("DM_FRAMEGEN_UI");
+        g_fg_ui_mode = !e || atoi(e) != 0;
+        MLOG("frame generation: %s (DM_FRAMEGEN_UI)", g_fg_ui_mode
+             ? "the game's own UI pass kept from the present: the picture before it and the one presented differ by the UI, block by block"
+             : "no UI mask: all the present's picture the generated frame takes is what fgmv_still and fgmv_hud find still and detailed");
+    }
+    return g_fg_ui_mode;
+}
+enum { FG_UI_COPIES = 4 };   // the copies of one frame while a target the last frames did not use is learned (the last one is the one the present shows)
+static pthread_mutex_t g_ui_mu = PTHREAD_MUTEX_INITIALIZER;
+static id<MTLTexture> g_fg_ui_ref, g_fg_ui_shown;   // the picture before the UI pass, and the one presented, at the picture's size and format
+static id<MTLTexture> g_fg_ui;   // the mask: R16Float, one block per 4x4 of the generated frame (fg_for)
+static id<MTLTexture> g_ui_mask;   // g_fg_ui as the replay thread sees it (taken once a frame, under the lock)
+static _Atomic uint64_t g_ui_crop;   // the last present's crop, w << 32 | h (snap_take): a pass whose picture is that is 1:1 with what the screen shows
+static struct { uint64_t serial, frame; int pass, have; } g_ui_hit;   // the UI pass confirmed for the frame being replayed
+static uint64_t g_ui_cache[2]; static int g_ui_cache_n;   // the targets of the last frames' UI passes: a picture in the cache is copied on sight, one a frame
+static uint64_t g_ui_copy_ser, g_ui_frame; static int g_ui_copy_pass, g_ui_copies;   // the replay's own: the pass whose picture g_fg_ui_ref holds, the frame's copies
+static int g_ui_ref_pass;   // the pass whose picture g_fg_ui_ref holds (a later pass's copy replaces it: that pass's own pair, or none)
+static id<MTLBuffer> g_fg_ui_stat;   // fgmv_uisum's answer, one word a ring slot (read with the snapshot's commit, no wait on the CPU)
+static int g_ui_dirty;   // the mask may hold something else than zeros (a new mask, or a written one): it is zeroed before a frame reads it without a UI pass
+static _Atomic int g_fg_ui_blank;   // the mask covered the picture: frames are shown as drawn, as in the game's menus (fg_menu_pause), until it does not
+#define FG_UI_BLANK 0.6f   // the part of the picture the UI takes past which the frame has nothing left to interpolate (menus, fades)
+// 8 bits a channel: the pictures the mask compares are copied and read as bytes, and what the picture holds is what the screen shows
+static int fg_ui_fmt(MTLPixelFormat f) {
+    switch (f) {
+        case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB: case MTLPixelFormatRGBA8Snorm: return 1;
+        default: return 0;
+    }
+}
+// The two pictures at the target's own size and format, in the host's memory; made again when the picture's size changes
+static int fg_ui_pics(id<MTLTexture> src) {
+    if (g_fg_ui_ref && g_fg_ui_shown && g_fg_ui_ref.width == src.width && g_fg_ui_ref.height == src.height && g_fg_ui_ref.pixelFormat == src.pixelFormat) return 1;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width height:src.height mipmapped:NO];
+    d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> a = [g_dev newTextureWithDescriptor:d], b = [g_dev newTextureWithDescriptor:d];
+    if (!a || !b) { RED_ONCE(178, "frame generation: no textures for the UI mask's two pictures"); return 0; }
+    [g_snap_res addAllocation:a]; [g_snap_res addAllocation:b]; [g_snap_res commit];   // the ones they replace stay resident (a frame still running may read them)
+    pthread_mutex_lock(&g_ui_mu); g_fg_ui_ref = a; g_fg_ui_shown = b; pthread_mutex_unlock(&g_ui_mu);
+    return 1;
+}
+// A pass opens: could it be the game's UI pass? One colour target of 8 bits a channel, level 0 with no view of it, opened with load (no clear) and no depth,
+// at the size of the crop the last present showed (the mask lives in the picture the screen shows, 1:1). Its picture is copied now, before a draw of the pass.
+// The target a frame's UI pass used last time is copied on sight, one a frame; a target of neither of the last two frames is copied while the frame has copies
+// left (FG_UI_COPIES): the pass chosen is the frame's last one, so the last copy is the one that matters.
+void fg_ui_pass_begin(id<MTLTexture> mt, uint64_t pass) {
+    g_fg_ui_watch_pass = 0;
+    if (g_fg_ui_mode != 1 || g_fgmv_ok <= 0 || !R.has_rt) return;
+    uint64_t f = atomic_load(&g_snap_next);   // the present these passes reach (mtl_set_frame is the replay tool's, not the live host's)
+    if (f != g_ui_frame) { g_ui_frame = f; g_ui_copies = 0; pthread_mutex_lock(&g_ui_mu); g_ui_mask = g_fg_ui; pthread_mutex_unlock(&g_ui_mu); }
+    if (!g_ui_mask) return;   // no mask texture yet (the interpolator's first frame): nothing to write into
+    const p_set_rt *rt = &R.rt;
+    if (rt->n != 1 || !rt->color[0] || rt->has_cview[0] || rt->depth || !mt) return;   // one colour target, no view of it, no depth
+    if (mt.textureType != MTLTextureType2D || mt.arrayLength != 1 || !fg_ui_fmt(mt.pixelFormat)) return;
+    uint64_t crop = atomic_load(&g_ui_crop);
+    if (!crop || mt.width != (NSUInteger)(crop >> 32) || mt.height != (NSUInteger)(crop & 0xffffffffu)) return;   // not the picture the present showed: no mask from it
+    int cached = 0; for (int i = 0; i < g_ui_cache_n; i++) if (g_ui_cache[i] == rt->color[0]->serial) cached = 1;
+    if (!cached && g_ui_copies >= FG_UI_COPIES) return;
+    if (!fg_ui_pics(mt)) return;
+    {   // the copy, in the replay stream: everything drawn into the picture before this pass has landed by the encoder's own barrier
+        id<MTL4ComputeCommandEncoder> b = blit();
+        enc_b_copy_texture(b, mt, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(mt.width, mt.height, 1), g_fg_ui_ref, 0, 0, MTLOriginMake(0, 0, 0));
+        enc_b_end(g_blit); g_blit = nil;
+    }
+    g_ui_copies++; g_ui_copy_ser = rt->color[0]->serial; g_ui_copy_pass = (int)pass; g_fg_ui_watch_pass = (int)pass; g_fg_ui_ds = 0;
+    pthread_mutex_lock(&g_ui_mu); g_ui_ref_pass = (int)pass; pthread_mutex_unlock(&g_ui_mu);
+    static int trace = -1; if (trace < 0) trace = getenv("DM_UI_TRACE") != NULL;   // DM_UI_TRACE=1: every copy, with the pass it belongs to (the detection's own trace)
+    if (trace) MLOG("ui trace: copy pass %llu serial %llu %lux%lu frame %llu copies %d", (unsigned long long)pass, (unsigned long long)rt->color[0]->serial, (unsigned long)mt.width, (unsigned long)mt.height, (unsigned long long)g_ui_frame, g_ui_copies);
+}
+// The mask from the two pictures, or zeros when this frame has none (both bindings the same texel, which differ by nothing): one block per thread, then its coverage
+static void fg_ui_mask(id<MTL4ComputeCommandEncoder> ce, id<MTLTexture> a, id<MTLTexture> b, int slot) {
+    [ce setArgumentTable:g_fgmv_args];
+    fgmv_bind(ce, FGMV_UIMASK, a, b, g_fg_ui, nil);
+    fgmv_grid(ce, g_fg_ui.width, g_fg_ui.height);
+    fgmv_step(ce);
+    fgmv_bind(ce, FGMV_UISUM, g_fg_ui, nil, nil, nil);
+    [g_fgmv_args setAddress:(g_fg_ui_stat.gpuAddress + 4 * (MTLGPUAddress)slot) atIndex:0];   // this ring slot's word: the snapshot's commit reads it (fg_ui_report)
+    [ce dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+// The pass ended: if it is the one whose picture was copied and none of its draws depth-tested or wrote depth, it is the frame's UI pass — the last one is the
+// one kept. Its picture presented (copy and mask) is taken with the present, where what the screen shows is known (fg_ui_take).
+void fg_ui_pass_end(uint64_t pass) {
+    if (g_fg_ui_watch_pass != (int)pass) return;
+    g_fg_ui_watch_pass = 0;
+    if (g_fg_ui_ds) return;
+    pthread_mutex_lock(&g_ui_mu);
+    g_ui_hit = (typeof(g_ui_hit)){.serial = g_ui_copy_ser, .frame = g_ui_frame, .pass = (int)pass, .have = 1};
+    pthread_mutex_unlock(&g_ui_mu);
+    if (g_ui_cache_n == 0 || g_ui_cache[g_ui_cache_n - 1] != g_ui_copy_ser) {   // the last two targets: one copy a frame instead of learning every frame
+        if (g_ui_cache_n < 2) g_ui_cache[g_ui_cache_n++] = g_ui_copy_ser;
+        else { g_ui_cache[0] = g_ui_cache[1]; g_ui_cache[1] = g_ui_copy_ser; }
+    }
+    g_ui_dirty = 1;
+}
+// What fg_ui_take wrote, for the commit's feedback: whether the mask ran and was the picture's, the frame and the target it belongs to, its size and the copies
+typedef struct { int ran, use, copies; uint64_t serial, frame; int w, h; } ui_take_t;
+// The mask of this frame, in the present's command buffer before the interpolation (fgmv_uimask, fgmv_uisum): the picture before the game's UI pass, copied as
+// it opened, and the one presented, copied here, differ by the UI alone. Zero when this frame has no such pass or the present does not show that picture 1:1 (a
+// game that scales, crops or composes it otherwise) — never a mask from the wrong picture, which would freeze the region of the previous HUD.
+static ui_take_t fg_ui_take(id<MTL4CommandBuffer> cb, int k, const tex_t *t, const int crop[4]) {
+    ui_take_t u = {0};
+    if (!g_fg_ui || g_fgmv_ok <= 0 || !g_fg_ui_stat) return u;
+    id<MTLTexture> ref = nil, shown = nil; typeof(g_ui_hit) hit; int ref_pass;
+    pthread_mutex_lock(&g_ui_mu); ref = g_fg_ui_ref; shown = g_fg_ui_shown; hit = g_ui_hit; ref_pass = g_ui_ref_pass; pthread_mutex_unlock(&g_ui_mu);
+    id<MTLTexture> src = tex_mtl(t); NSUInteger r[4];
+    int use = fg_ui_on() && src && ref && shown && hit.have && hit.pass == ref_pass && hit.frame == atomic_load(&g_snap_next) && hit.serial == t->serial
+              && present_crop_rect(src, crop, r) && r[0] == 0 && r[1] == 0 && r[2] == ref.width && r[3] == ref.height;
+    if (!use && !g_ui_dirty) return u;
+    id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit | MTLStageDispatch visibilityOptions:resource_vis()];   // after the frame's work and its copy into the snapshot
+    if (use) enc_b_copy_texture(ce, src, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(shown.width, shown.height, 1), shown, 0, 0, MTLOriginMake(0, 0, 0));
+    fg_ui_mask(ce, use ? ref : g_fg_flags, use ? shown : g_fg_flags, k);
+    [ce endEncoding];
+    g_ui_dirty = use;   // a mask written must be zeroed before a frame that has none reads it
+    u.ran = 1; u.use = use; u.copies = g_ui_copies; u.serial = hit.serial; u.frame = atomic_load(&g_snap_next);
+    u.w = ref ? (int)ref.width : 0; u.h = ref ? (int)ref.height : 0;
+    return u;
+}
+// The mask's coverage of the picture, read once the snapshot's command buffer has run (its commit's feedback: no wait on the CPU, which would hold the game's
+// queue for the frame's own work). Logged every frame the mask ran; past FG_UI_BLANK the frames are shown as drawn, as in the game's menus, and the next one
+// with a picture left to interpolate turns generation back on.
+static void fg_ui_report(int k, ui_take_t u) {
+    if (!g_fg_ui_stat) return;
+    float c = ((float *)g_fg_ui_stat.contents)[k];
+    int blank = u.use && c > FG_UI_BLANK;
+    MLOG("frame generation: UI mask frame %llu: %s, %dx%d, target %llu, %.1f %% of the picture covered, %d copies this frame%s", (unsigned long long)u.frame,
+         u.use ? "the game's UI pass" : "none", u.w, u.h, (unsigned long long)u.serial, 100 * (double)c, u.copies,
+         blank ? " (no part left to interpolate: the frame is shown as drawn)" : "");
+    if (blank != atomic_load(&g_fg_ui_blank)) {
+        atomic_store(&g_fg_ui_blank, blank);
+        MLOG("frame generation: %s", blank ? "the UI covers the picture: frames are shown as drawn, as in the game's menus, until it does not (DM_FRAMEGEN_UI)"
+                                           : "the picture has room again: frames are generated");
+    }
+}
 // The interpolator for col's format and size, with its constant inputs (made again when either changes); nil when MetalFX makes none
 static id<MTL4FXFrameInterpolator> fg_for(id<MTLTexture> col) {
     NSUInteger key[3] = {col.pixelFormat, col.width, col.height};
@@ -19768,9 +19919,17 @@ static id<MTL4FXFrameInterpolator> fg_for(id<MTLTexture> col) {
         MTLTextureDescriptor *cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float width:iw height:ih mipmapped:NO];
         cd.storageMode = MTLStorageModePrivate; cd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         id<MTLTexture> tl = [g_dev newTextureWithDescriptor:td], sb = [g_dev newTextureWithDescriptor:bd], kb = [g_dev newTextureWithDescriptor:bd], pm = [g_dev newTextureWithDescriptor:pd], cf = [g_dev newTextureWithDescriptor:cd];
-        if (!tl || !sb || !kb || !pm || !cf) { RED_ONCE(170, "frame generation: no textures for the motion"); return nil; }
+        id<MTLTexture> uf = [g_dev newTextureWithDescriptor:bd];   // the UI mask: the same grid and format as fg_keep's blocks (fg_ui_take)
+        if (!tl || !sb || !kb || !pm || !cf || !uf) { RED_ONCE(170, "frame generation: no textures for the motion"); return nil; }
         [g_snap_res addAllocation:tl]; [g_snap_res addAllocation:sb]; [g_snap_res addAllocation:kb]; [g_snap_res addAllocation:pm]; [g_snap_res addAllocation:cf];
+        [g_snap_res addAllocation:uf];
         g_fg_tiles = tl; g_fg_still = sb; g_fg_keep = kb; g_fg_pmask = pm; g_fg_conf = cf;
+        pthread_mutex_lock(&g_ui_mu); g_fg_ui = uf; pthread_mutex_unlock(&g_ui_mu);
+        g_ui_dirty = 1;   // a new mask holds nothing the interpolator may read: fg_ui_take writes zeros for the first frame that has no UI pass
+    }
+    if (mv && !g_fg_ui_stat) {   // fgmv_uisum's answer, a word a ring slot (read with the snapshot's commit)
+        g_fg_ui_stat = [g_dev newBufferWithLength:sizeof(float) * SNAP_MAX options:MTLResourceStorageModeShared];
+        if (g_fg_ui_stat) { memset(g_fg_ui_stat.contents, 0, sizeof(float) * SNAP_MAX); [g_snap_res addAllocation:g_fg_ui_stat]; }
     }
     // The ones they replace stay resident: a generation committed before this one may still read them (they are tiny, and a size change is rare)
     [g_snap_res addAllocation:dep]; [g_snap_res addAllocation:mot]; [g_snap_res commit];
@@ -19940,7 +20099,8 @@ static void fg_keep(id<MTL4CommandBuffer> cb, int k, int pk, id<MTLTexture> gen)
     fgmv_bind(ce, FGMV_HUD, g_fg_still, g_fg_keep, g_fg_conf, g_fg_flags); [g_fgmv_args setAddress:g_fg_sw.gpuAddress atIndex:0];
     fgmv_grid(ce, g_fg_keep.width, g_fg_keep.height); fgmv_step(ce);
     fgmv_bind(ce, FGMV_PSTILL, col, prev, prev2, g_fg_pmask); fgmv_grid(ce, col.width, col.height); fgmv_step(ce);
-    fgmv_bind(ce, FGMV_KEEP, col, g_fg_keep, gen, g_fg_pmask); [g_fgmv_args setTexture:g_fg_motion.gpuResourceID atIndex:4]; fgmv_grid(ce, gen.width, gen.height);
+    fgmv_bind(ce, FGMV_KEEP, col, g_fg_keep, gen, g_fg_pmask); [g_fgmv_args setTexture:g_fg_motion.gpuResourceID atIndex:4];
+    [g_fgmv_args setTexture:g_fg_ui.gpuResourceID atIndex:5]; fgmv_grid(ce, gen.width, gen.height);   // the game's own UI pass, where it has one (fg_ui_take wrote zeros otherwise)
     [ce barrierAfterStages:MTLStageDispatch beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the present reads gen
     [ce endEncoding];
 }
@@ -20079,6 +20239,7 @@ static uint64_t snap_take(const tex_t *t, double period, const int crop[4], int 
     // texture copied its frames were generated at 3136x1440, 44 % of it never shown (log 75: interpolation p50 13-15 ms beside 14-16 ms of the game's own GPU frame, frames dropping)
     NSUInteger tw = src.width, th = src.height, cr[4];
     int fgc = fg_on() && !atomic_load_explicit(&g_origin_ll, memory_order_relaxed) && present_crop_rect(src, crop, cr);
+    if (fgc) atomic_store(&g_ui_crop, ((uint64_t)cr[2] << 32) | cr[3]);   // what the screen shows of the picture: the UI mask is 1:1 with it (fg_ui_pass_begin)
     int scaled = fgc && fg_shown_size(cr[2], cr[3], &tw, &th);
     int sub = fgc && !scaled && (cr[0] || cr[1] || cr[2] != src.width || cr[3] != src.height);
     if (!scaled) { tw = sub ? cr[2] : src.width; th = sub ? cr[3] : src.height; }
@@ -20107,21 +20268,27 @@ static uint64_t snap_take(const tex_t *t, double period, const int crop[4], int 
         [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the game's next writes to its texture come after the copy
         [ce endEncoding];
     }
+    int ui_ran = 0; ui_take_t ui_made = {0};
     if (fg_on()) {   // the frame between the previous present and this one (frame generation): only for presents held two ticks or more, as the display link shows it
         int pk = (int)((atomic_load(&g_snap_next) + (uint64_t)g_snap_n - 1) % (uint64_t)g_snap_n);
         g_snap[k].seq = g_fg_seq;
         int paused = fg_menu_pause();   // the game's menus: no interpolation, each present shown on both ticks, as at 60 fps below
         if (!paused && fg_mv_on()) fg_luma(cb, k);
-        if (period > 0.025 && !paused) fg_encode(cb, k, pk, period); else g_fg_warm = 0;
+        if (fg_mv_on()) fg_for(g_snap[k].tex);   // the size the mask's grid follows: made here so the mask below is written at the right one
+        ui_take_t ui = fg_ui_take(cb, k, t, crop);   // the game's UI pass of this frame, into texture 5 of fg_keep (zeros when there is none)
+        // A picture the UI covers whole (a menu, a fade) has nothing left to interpolate: shown as drawn, as in the menus, until one does
+        if (period > 0.025 && !paused && !(ui.use && atomic_load(&g_fg_ui_blank))) fg_encode(cb, k, pk, period); else g_fg_warm = 0;
+        ui_ran = ui.ran; ui_made = ui;
     }
     cb_end(cb, nil);
     MTL4CommitOptions *o = nil;
-    if (g_snap[k].gen_ok && g_fg_heap) {
-        o = [MTL4CommitOptions new]; id<MTL4CounterHeap> heap = g_fg_heap; int slot = k;
+    if ((g_snap[k].gen_ok && g_fg_heap) || ui_ran) {
+        o = [MTL4CommitOptions new]; id<MTL4CounterHeap> heap = g_fg_heap; int slot = k; int gen = g_snap[k].gen_ok; ui_take_t u = ui_made;
         [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
             if (f.error) { MLOG("[RED] frame generation: %s", f.error.description.UTF8String); return; }
-            NSData *r = [heap resolveCounterRange:NSMakeRange(2 * slot, 2)]; const uint64_t *ts = r.bytes;
-            if (ts && ts[1] > ts[0]) fg_gpu_note((ts[1] - ts[0]) * (1.0 / (double)[g_dev queryTimestampFrequency]));
+            if (gen && heap) { NSData *r = [heap resolveCounterRange:NSMakeRange(2 * slot, 2)]; const uint64_t *ts = r.bytes;
+                if (ts && ts[1] > ts[0]) fg_gpu_note((ts[1] - ts[0]) * (1.0 / (double)[g_dev queryTimestampFrequency])); }
+            if (u.ran) fg_ui_report(slot, u);
         }];
     }
     uint64_t v = ++g_snap_v;

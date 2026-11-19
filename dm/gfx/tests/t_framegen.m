@@ -298,6 +298,174 @@ static int guards_case(void) {
     mtl_drain();
     printf("frame generation guards: %d checks, %d failed\n", checks, failed); return failed != 0;
 }
+// "t_framegen ui": frame generation's UI mask (DM_FRAMEGEN_UI, nvn_mtl.m fg_ui_pass_begin/fg_ui_take). Real passes through the replay into the picture the
+// present shows, opened the way a game opens them: a pass that clears the picture and draws a bright band (the world, which moves between presents), then passes
+// opened with load and no depth that draw the HUD into the same picture. The frame's *last* such pass is the one whose picture the mask compares — the one
+// before it already holds the HUDs drawn before it — a pass whose draw depth-tests is not one, a present that does not show the picture 1:1 gets no mask, a
+// picture the UI covers whole is shown as drawn, and with the mask off nothing changes. The world moves, so a mask taken from another frame would show it.
+enum { UW = 384, UH = 216, UBW = UW / 4, UBH = UH / 4 };   // the picture, and the mask's grid: 96x54 blocks
+static tex_t g_ui_win; static prog_t g_ui_prog;
+static uint8_t g_ui_cmd[1 << 16]; static size_t g_ui_used;
+static void u_emit(unsigned op, const void *p, size_t n) {
+    size_t z = (8 + n + 7) & ~7ull; op_hdr h = {op, (uint32_t)z};
+    memcpy(g_ui_cmd + g_ui_used, &h, 8); if (n) memcpy(g_ui_cmd + g_ui_used + 8, p, n); g_ui_used += z;
+}
+// One pass: the world's (band >= 0) clears the picture and draws a bright band at band (the world's own motion), a UI pass draws the HUD's rectangle over the
+// picture it loads. dt: the draw depth-tests and writes, as a game's own pass that is not its UI one does (the pass is not confirmed).
+static void u_pass(int band, const int hud[4], int dt) {
+    p_set_rt rt = {.n = 1}; rt.color[0] = &g_ui_win; u_emit(OP_SET_RT, &rt, sizeof rt);
+    p_bind_program bp = {.prog = &g_ui_prog, .stages = 3}; u_emit(OP_BIND_PROGRAM, &bp, sizeof bp);
+    if (band >= 0) { p_scissor full = {0, 0, UW, UH}; u_emit(OP_SCISSOR, &full, sizeof full);   // the clear covers the picture: a load action, as a game clears with
+        p_clear_color cc = {.index = 0, .mask = 15, .rgba = {0.16f, 0.16f, 0.2f, 1}}; u_emit(OP_CLEAR_COLOR, &cc, sizeof cc); }
+    ds_st ds = {.dt = dt != 0, .dw = dt != 0, .df = NVN_DEPTH_FUNC_ALWAYS};
+    p_bind_state bs = {.kind = 5}; memcpy(bs.bytes, &ds, sizeof ds); u_emit(OP_BIND_STATE, &bs, sizeof bs);
+    p_scissor sc = band >= 0 ? (p_scissor){band, 76, 40, 44} : (p_scissor){hud[0], hud[1], hud[2], hud[3]}; u_emit(OP_SCISSOR, &sc, sizeof sc);
+    p_draw d = {.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = 3, .instances = 1}; u_emit(OP_DRAW, &d, sizeof d);
+}
+// A frame: the world at band, then the UI passes of hud_a and hud_b (each its own pass, as the game opens them), one submission
+static void u_frame(int band, const int *hud_a, const int *hud_b, int dt) {
+    mtl_sub_begin();
+    { g_ui_used = 0; u_pass(band, NULL, 0); u_emit(OP_END, NULL, 0); mtl_exec(g_ui_cmd); rp_end(); }
+    if (hud_a) { g_ui_used = 0; u_pass(-1, hud_a, 0); u_emit(OP_END, NULL, 0); mtl_exec(g_ui_cmd); rp_end(); }
+    if (hud_b) { g_ui_used = 0; u_pass(-1, hud_b, dt); u_emit(OP_END, NULL, 0); mtl_exec(g_ui_cmd); rp_end(); }
+    if (!mtl_wait(mtl_sub_commit(), 5000000000ull)) { printf("ui: the frame's GPU work did not complete\n"); failed++; }
+}
+static int u_present(const int crop[4]) {   // present the picture the passes drew; returns its ring slot
+    for (int i = 0; i < 50; i++) {   // a ring slot still busy takes no snapshot: the test paces the ring itself, so present again
+        uint64_t n0 = atomic_load(&g_snap_next);
+        present_enqueue(&g_ui_win, 1 / 30.0, crop, 0, NULL); mtl_present_flush(); copied();
+        if (atomic_load(&g_snap_next) != n0) return last_slot();
+        usleep(2000);
+    }
+    printf("ui: a present found no free ring slot\n"); failed++;
+    return last_slot();
+}
+static float *u_mask(int *bw, int *bh) {   // the mask's blocks, R16Float, as floats (its grid, which follows the generated frame's size)
+    *bw = (int)g_fg_ui.width; *bh = (int)g_fg_ui.height; long n = (long)*bw * *bh;
+    id<MTLBuffer> out = [g_dev newBufferWithLength:n * 2 options:MTLResourceStorageModeShared]; if (!out) exit(2);
+    id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:g_fg_ui sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(*bw, *bh, 1) toBuffer:out destinationOffset:0
+        destinationBytesPerRow:*bw * 2 destinationBytesPerImage:n * 2];
+    [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    float *m = malloc(n * sizeof *m); const uint16_t *h = out.contents;
+    for (long i = 0; i < n; i++) m[i] = g_half(h[i]);
+    return m;
+}
+static float u_cov(const float *m, int bw, int bh, const int r[4]) {   // the mean of the blocks under a pixel rectangle of the picture
+    int x0 = r[0] * bw / UW, x1 = (r[0] + r[2] - 1) * bw / UW, y0 = r[1] * bh / UH, y1 = (r[1] + r[3] - 1) * bh / UH;
+    double s = 0; int n = 0;
+    for (int y = y0; y <= y1 && y < bh; y++) for (int x = x0; x <= x1 && x < bw; x++) { s += m[y * bw + x]; n++; }
+    return n ? (float)(s / n) : 0;
+}
+static float u_all(const float *m, int bw, int bh) { double s = 0; for (long i = 0; i < (long)bw * bh; i++) s += m[i]; return (float)(s / ((double)bw * bh)); }
+static int ui_case(void) {
+    setenv("DM_FRAMEGEN", "1", 1); setenv("DM_PRESENT_SNAP", "1", 1); setenv("DM_PRESENT_HZ", "0", 1); setenv("DM_PRESENT_LINK", "0", 1);
+    setenv("DM_PSO_PREPARE", "0", 1);   // the prepare step would read the game's shader map: this case draws with a program of its own (as the other draw tests do, without a layer)
+    alarm(120); setvbuf(stdout, NULL, _IONBF, 0);
+    mtl_init();
+    g_test_layer = [CAMetalLayer layer]; g_test_layer.device = g_dev; g_test_layer.drawableSize = CGSizeMake(UW, UH); g_test_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    mtl_present_screen(UW, UH); mtl_present_layer(UW, UH);
+    state_reset(); memset(&R, 0, sizeof R);
+    // The picture the passes draw into (the game's window texture), and a program that fills whatever the scissor leaves of it (the world's band, the HUD)
+    { MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:UW height:UH mipmapped:NO];
+      d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+      id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d]; if (!mt) return 2;
+      g_ui_win = (tex_t){.magic = MAGIC('T','E','X',0), .serial = 97001};
+      g_ui_win.d = (nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8, .width = UW, .height = UH, .depth = 1, .levels = 1, .samples = 1};
+      serial_put(g_ui_win.serial, mt); res_add(mt); res_commit(); }
+    { NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+          "vertex float4 v(uint n [[vertex_id]]) { float2 p[3] = {float2(-1,-1), float2(3,-1), float2(-1,3)}; return float4(p[n % 3], 0, 1); }\n"
+          "fragment float4 f() { return float4(0.94, 0.93, 0.86, 1); }\n" options:nil error:&e];
+      if (!lib) { printf("ui: %s\n", e.localizedDescription.UTF8String); return 2; }
+      NvProg *pr = [NvProg new]; pr->sh[0] = [NvShader new]; pr->sh[0]->fn = [lib newFunctionWithName:@"v"];
+      pr->sh[1] = [NvShader new]; pr->sh[1]->fn = [lib newFunctionWithName:@"f"]; pr->sh[1]->stage = 1;
+      g_ui_prog = (prog_t){.serial = 97002}; serial_put(g_ui_prog.serial, pr); }
+    CHECK("frame generation on, the UI mask on by default", fg_on() && fg_ui_on());
+    const int hud_a[4] = {20, 150, 88, 44}, hud_b[4] = {210, 150, 128, 44};   // the HUD, drawn by the frame's first and last UI pass
+    int band = 40, bw, bh; float *m;
+    // A picture standing still but for the world's band, the HUD at hud_a: the interpolator's history from this, then four more of the same
+    for (int i = 0; i < 5; i++, band += 24) { u_frame(band, hud_a, NULL, 0); u_present(NULL); }
+    // The HUD moves to hud_b in the frame's last UI pass: the mask is that pass's alone — the picture before it holds hud_a already — and fg_keep takes those
+    // blocks from the present
+    band += 24; u_frame(band, hud_a, hud_b, 0);
+    int k = u_present(NULL);
+    CHECK("with a UI pass the frame has one to generate from", g_snap[k].gen_ok);
+    { m = u_mask(&bw, &bh);
+      float ca = u_cov(m, bw, bh, hud_a), cb = u_cov(m, bw, bh, hud_b);
+      const int wband[4] = {band, 76, 40, 44}; float cw = u_cov(m, bw, bh, wband), all = u_all(m, bw, bh);
+      printf("ui: the mask covers %.2f of the first pass's HUD, %.2f of the last one's, %.2f of the world's band; %.1f %% of the picture in all\n", ca, cb, cw, 100 * all);
+      CHECK("the last UI pass of the frame is the boundary: its HUD is in the mask, the earlier one is not", cb > 0.75f && ca < 0.1f);
+      CHECK("the world's own change is not in the mask", cw < 0.1f);
+      CHECK("the mask covers a part of the picture, not all of it", all > 0.02f && all < 0.2f);
+      free(m); }
+    // The generated frame's HUD is the present's own pixels (the newest HUD, at the rate the game draws it), where the mask covers it
+    { uint8_t *cur = g_grab(g_snap[k].tex), *gen = g_grab(g_snap[k].gen); long n = 0, same = 0; if (!cur || !gen) { printf("ui: no readback\n"); return 2; }
+      for (int y = hud_b[1]; y < hud_b[1] + hud_b[3]; y++) for (int x = hud_b[0]; x < hud_b[0] + hud_b[2]; x++) {
+          int o = 4 * (y * UW + x); n++;
+          if (abs(gen[o] - cur[o]) <= 2 && abs(gen[o + 1] - cur[o + 1]) <= 2 && abs(gen[o + 2] - cur[o + 2]) <= 2) same++; }
+      printf("ui: the generated frame at the last HUD: %ld of %ld pixels the present's own\n", same, n);
+      CHECK("the HUD of the generated frame is the present's own picture", same > 0.85 * n);
+      free(cur); free(gen); }
+    // A pass whose draw depth-tests is not a UI pass: the frame's last candidate was not confirmed, and the picture its copy replaced was the confirmed one's,
+    // so the frame has no pair (no mask) rather than that pass's
+    for (int i = 0; i < 4; i++, band += 24) { u_frame(band, hud_b, NULL, 0); u_present(NULL); }
+    band += 24; u_frame(band, hud_b, hud_a, 1);
+    k = u_present(NULL);
+    { m = u_mask(&bw, &bh); float all = u_all(m, bw, bh), ca = u_cov(m, bw, bh, hud_a);
+      printf("ui: a depth-tested last pass: the mask covers %.3f of the picture (%.2f of its HUD)\n", all, ca);
+      CHECK("a UI pass whose draw depth-tests is not taken as the boundary (no mask, not that pass's)", all == 0);
+      free(m); }
+    // A frame with no UI pass at all (one that only clears its picture): no mask, never the one of the frame before
+    for (int i = 0; i < 4; i++, band += 24) { u_frame(band, hud_a, hud_b, 0); u_present(NULL); }
+    { mtl_sub_begin(); g_ui_used = 0; u_pass(band += 24, NULL, 0); u_emit(OP_END, NULL, 0); mtl_exec(g_ui_cmd); rp_end();
+      mtl_wait(mtl_sub_commit(), 5000000000ull);
+      k = u_present(NULL);
+      m = u_mask(&bw, &bh); float all = u_all(m, bw, bh);
+      printf("ui: a frame with no UI pass: the mask covers %.3f of the picture\n", all);
+      CHECK("a frame with no UI pass gets a mask of zeros", all == 0);
+      free(m); }
+    // A present that does not show the picture 1:1 (a crop of its left half): no mask at all, the frames of before
+    for (int i = 0; i < 4; i++, band += 24) { u_frame(band, hud_a, NULL, 0); u_present(NULL); }
+    { const int half[4] = {0, 0, UW / 2, UH};
+      band += 24; u_frame(band, hud_a, hud_b, 0); k = u_present(half);
+      m = u_mask(&bw, &bh); float all = u_all(m, bw, bh);
+      printf("ui: a cropped present: the mask covers %.3f of the picture\n", all);
+      CHECK("a present that does not show the picture 1:1 gets no mask", all == 0);
+      free(m); }
+    for (int i = 0; i < 4; i++, band += 24) { u_frame(band, hud_a, hud_b, 0); u_present(NULL); }   // the picture back at its size
+    // A UI that covers the picture whole (a menu, a fade): counted as no generation, the frames after it shown as drawn
+    { const int whole[4] = {0, 0, UW, UH};
+      band += 24; u_frame(band, hud_a, whole, 0); k = u_present(NULL);
+      float c = ((float *)g_fg_ui_stat.contents)[k];
+      m = u_mask(&bw, &bh); float mal = u_all(m, bw, bh); free(m);
+      for (int t = 0; t < 400 && !atomic_load(&g_fg_ui_blank); t++) usleep(500);
+      printf("ui: a full-picture UI: %.0f %% of the picture covered (the mask's blocks %.2f of it), blank %d\n", 100 * c, mal, atomic_load(&g_fg_ui_blank));
+      CHECK("a UI that covers the picture is measured as such", c > 0.6f && mal > 0.6f);
+      CHECK("past 60 % of the picture the frame counts as not generated", atomic_load(&g_fg_ui_blank) == 1);
+      band += 24; u_frame(band, hud_a, hud_b, 0); k = u_present(NULL);
+      CHECK("a frame the UI covers is shown as drawn", g_snap[k].gen_ok == 0);
+      for (int t = 0; t < 400 && atomic_load(&g_fg_ui_blank); t++) usleep(500);
+      CHECK("once the picture has room again, frames are generated again", atomic_load(&g_fg_ui_blank) == 0); }
+    // The mask off (DM_FRAMEGEN_UI=0): the same pair, a HUD that changes between two presents, and the generated frame is the interpolator's mix of the two
+    // HUDs again — no block of it the present's own, which is what the mask on gives (above). The mask written as zeros is `k = max(keep, 0)`: the keep the
+    // frame would have without it, so the off path is the frame generation of before.
+    { const int pair_a[4] = {40, 120, 64, 30}, pair_b[4] = {240, 120, 64, 30};
+      g_fg_ui_mode = 0; g_fg_warm = 0; calm();
+      int b0 = 60;
+      for (int i = 0; i < 5; i++, b0 += 16) { u_frame(b0, pair_a, NULL, 0); u_present(NULL); }
+      b0 += 16; u_frame(b0, pair_a, pair_b, 0); k = u_present(NULL);
+      CHECK("with the mask off the frame is still generated", g_snap[k].gen_ok);
+      { uint8_t *cur = g_grab(g_snap[k].tex), *gen = g_grab(g_snap[k].gen); long n = 0, same = 0; if (!cur || !gen) { printf("ui: no readback\n"); return 2; }
+        for (int y = pair_b[1]; y < pair_b[1] + pair_b[3]; y++) for (int x = pair_b[0]; x < pair_b[0] + pair_b[2]; x++) {
+            int o = 4 * (y * UW + x); n++;
+            if (abs(gen[o] - cur[o]) <= 2 && abs(gen[o + 1] - cur[o + 1]) <= 2 && abs(gen[o + 2] - cur[o + 2]) <= 2) same++; }
+        printf("ui: with the mask off, the generated frame at the last HUD: %ld of %ld pixels the present's own\n", same, n);
+        CHECK("with the mask off the HUD is the interpolator's, not the present's", same < 0.5 * n);
+        free(cur); free(gen); }
+      g_fg_ui_mode = -1; }
+    mtl_drain();
+    printf("frame generation UI mask: %d checks, %d failed\n", checks, failed); return failed != 0;
+}
 // "t_framegen stab": how steady generated frames are (a measurement, it reports and fails nothing). A detailed scene (value noise of three scales, colour) pans at a steady
 // SPEED px a frame and then a fast one, under an opaque HUD (top left: a box of glyph-like bars) and a half-transparent panel (bottom right, the scene through it, with
 // bars in it). Each generated frame is scored against the ideal halfway picture (the scene at the mean of the two offsets, the HUD as it is): mean error on the scene,
@@ -378,6 +546,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     if (argc > 1 && !strcmp(argv[1], "size")) return size_case();
     if (argc > 1 && !strcmp(argv[1], "stab")) return stab_case();
     if (argc > 1 && !strcmp(argv[1], "guards")) return guards_case();
+    if (argc > 1 && !strcmp(argv[1], "ui")) return ui_case();
     // "fusion": the run below with the cut guard off, as the frames were generated before it (every case of it must come out the same)
     if (argc > 1 && !strcmp(argv[1], "fusion")) setenv("DM_FRAMEGEN_CUT", "0", 1);
     alarm(90); setvbuf(stdout, NULL, _IONBF, 0);

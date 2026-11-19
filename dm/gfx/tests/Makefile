@@ -339,6 +339,7 @@ check_t_framegen: t_framegen
 	MTL_DEBUG_LAYER=1 ./t_framegen
 	MTL_DEBUG_LAYER=1 ./t_framegen size
 	MTL_DEBUG_LAYER=1 ./t_framegen guards
+	MTL_DEBUG_LAYER=1 ./t_framegen ui
 	MTL_DEBUG_LAYER=1 ./t_framegen fusion
 t_reorder_chain: t_reorder_chain.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_reorder_chain.m $(MTL_T_SRC) $(FW)
