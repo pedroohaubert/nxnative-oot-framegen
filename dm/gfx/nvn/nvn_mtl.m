@@ -19645,6 +19645,9 @@ static int g_snap_n = 2;
 // one before (a snapshot skipped, a new size) starts the interpolator's history again, and its generated frames are shown only from the third one on, the first ones it
 // makes being the new frame unchanged. Only on the display link, where frames are held for their present interval: with the present thread (DM_PRESENT_LINK=0, the rescue
 // mode) and for present intervals under 1.5 ticks the generated frames are not shown
+// A cut's two pictures have no frame between them, and the interpolation of the pair is a picture neither of them has (the two scenes mixed for a tick, seen in play).
+// It is decided on the command buffer that already holds the interpolation and answered with the present's own picture (fgmv_cut, DM_FRAMEGEN_CUT). Nothing is read
+// back on the CPU, which would wait for the frame's own work and hold the game's queue
 static int g_fg_mode = -1;
 static int fg_on(void) {
     if (g_fg_mode >= 0) return g_fg_mode;
@@ -19658,28 +19661,47 @@ static int fg_on(void) {
     return g_fg_mode = v;
 }
 // DM_FRAMEGEN_MV (default 1): frame generation's motion from the presented pictures (fg_motion) and the still HUD kept (fg_keep); 0: no motion, as X6-X9
-static id<MTLComputePipelineState> g_fgmv_ps[8]; static id<MTL4ArgumentTable> g_fgmv_args; static int g_fgmv_ok = -1;
-enum { FGMV_LUMA, FGMV_SEARCH, FGMV_PICK, FGMV_STILL, FGMV_HUD, FGMV_KEEP, FGMV_PSTILL, FGMV_CONF };
+static id<MTLComputePipelineState> g_fgmv_ps[9]; static id<MTL4ArgumentTable> g_fgmv_args; static int g_fgmv_ok = -1;
+static id<MTLBuffer> g_fg_sw; static id<MTLTexture> g_fg_flags;   // the cut guard's switch and fgmv_cut's flags
+enum { FGMV_LUMA, FGMV_SEARCH, FGMV_PICK, FGMV_CUT, FGMV_STILL, FGMV_HUD, FGMV_KEEP, FGMV_PSTILL, FGMV_CONF };
+// DM_FRAMEGEN_CUT (default 1): a cut's two pictures are shown as they are drawn, not with a picture invented between them (fgmv_cut, fgmv_hud). Its switch
+// reaches the kernels as a bit of g_fg_sw, which the test flips to compare a pair with and without it; off, the generated frames are the ones before it
+static int g_fg_guard_cut = -1;
+static int fg_cut_on(void) {
+    if (g_fg_guard_cut < 0) {
+        const char *e = getenv("DM_FRAMEGEN_CUT"); g_fg_guard_cut = !e || atoi(e) != 0;
+        if (e) MLOG("frame generation: %s (DM_FRAMEGEN_CUT=%s)", g_fg_guard_cut ? "a cut's two pictures shown, no frame invented between them" : "no cut guard: a cut's pair is interpolated as any other", e);
+    }
+    return g_fg_guard_cut;
+}
 static int fg_mv_on(void) {
     if (g_fgmv_ok >= 0) return g_fgmv_ok;
     const char *e = getenv("DM_FRAMEGEN_MV");
     if (e && atoi(e) <= 0) { MLOG("frame generation: no motion given to the interpolator (DM_FRAMEGEN_MV=0): its own flow finds it, up to about 64 px a frame"); return g_fgmv_ok = 0; }
     NSError *err = nil; id<MTLLibrary> lib = host_lib("fgmv", &err);
-    static const char *fn[8] = {"fgmv_luma", "fgmv_search", "fgmv_pick", "fgmv_still", "fgmv_hud", "fgmv_keep", "fgmv_pstill", "fgmv_conf"};
+    static const char *fn[9] = {"fgmv_luma", "fgmv_search", "fgmv_pick", "fgmv_cut", "fgmv_still", "fgmv_hud", "fgmv_keep", "fgmv_pstill", "fgmv_conf"};
     // DM_FRAMEGEN_PASTE=1: blocks whose motion is not trusted take the present's own pixels whole (fgmv.metal FGMV_PASTE: off by default, squares that stepped at 30 fps on camera turns)
     const char *pe = getenv("DM_FRAMEGEN_PASTE"); bool paste = pe && atoi(pe) > 0;
     MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new]; [cv setConstantValue:&paste type:MTLDataTypeBool atIndex:0];
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 9; i++) {
         id<MTLFunction> f = !lib ? nil : i == FGMV_HUD ? [lib newFunctionWithName:@(fn[i]) constantValues:cv error:&err] : [lib newFunctionWithName:@(fn[i])];
         g_fgmv_ps[i] = f ? [g_dev newComputePipelineStateWithFunction:f error:&err] : nil;
         if (!g_fgmv_ps[i]) { MLOG("[RED] frame generation: no %s pipeline (%s): the interpolator gets no motion, as X6-X9", fn[i], err.description.UTF8String); return g_fgmv_ok = 0; }
     }
     if (g_fgmv_ps[FGMV_SEARCH].maxTotalThreadsPerThreadgroup < 256) { MLOG("[RED] frame generation: the motion search needs 256 threads a group, this GPU gives %lu: no motion given", (unsigned long)g_fgmv_ps[FGMV_SEARCH].maxTotalThreadsPerThreadgroup); return g_fgmv_ok = 0; }
     MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 5;   // fgmv_keep reads the motion at 4
+    ad.maxBufferBindCount = 1;   // the cut guard's switch, g_fg_sw
     g_fgmv_args = [g_dev newArgumentTableWithDescriptor:ad error:&err];
     if (!g_fgmv_args) { MLOG("[RED] frame generation: no argument table for the motion (%s): no motion given", err.description.UTF8String); return g_fgmv_ok = 0; }
-    MLOG("frame generation: motion found from the presented pictures (DM_FRAMEGEN_MV=1: 64 px tiles searched within 192 px at 1/8 size, refined to 2 px), the still HUD kept from the present%s",
-         paste ? "; blocks whose motion is not trusted pasted from it (DM_FRAMEGEN_PASTE=1)" : "");
+    // The guard's inputs: its switch (written before every generated frame) and fgmv_cut's flags (1x1: a cut, its measures)
+    g_fg_sw = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    MTLTextureDescriptor *fd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:1 height:1 mipmapped:NO];
+    fd.storageMode = MTLStorageModePrivate; fd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    g_fg_flags = [g_dev newTextureWithDescriptor:fd];
+    if (!g_fg_sw || !g_fg_flags) { MLOG("[RED] frame generation: no switch or flags for the cut guard (%s): no motion given", err.description.UTF8String); return g_fgmv_ok = 0; }
+    [g_snap_res addAllocation:g_fg_sw]; [g_snap_res addAllocation:g_fg_flags]; [g_snap_res commit];
+    MLOG("frame generation: motion found from the presented pictures (DM_FRAMEGEN_MV=1: 64 px tiles searched within 192 px at 1/8 size, refined to 2 px), the still HUD kept from the present%s%s",
+         paste ? "; blocks whose motion is not trusted pasted from it (DM_FRAMEGEN_PASTE=1)" : "", fg_cut_on() ? ", a cut's two pictures taken from the present instead of a frame between them" : "");
     return g_fgmv_ok = 1;
 }
 // The formats fg_keep may write the generated frame in (shader writes; not the sRGB ones)
@@ -19902,15 +19924,20 @@ static void fg_motion(id<MTL4ComputeCommandEncoder> ce, int k, int pk) {
     fgmv_bind(ce, FGMV_PICK, cl, pl, g_fg_tiles, g_fg_motion); fgmv_grid(ce, g_fg_motion.width, g_fg_motion.height);
 }
 // After the interpolation: the still detailed pixels of slot k's picture, and still ones near them (a HUD), written over the generated frame (fgmv_still, fgmv_hud, fgmv_keep)
+// The pair is a cut or not (fgmv_cut) before any of them, and its flags choose the whole present's picture for a cut (DM_FRAMEGEN_CUT)
 static void fg_keep(id<MTL4CommandBuffer> cb, int k, int pk, id<MTLTexture> gen) {
     id<MTLTexture> col = g_snap[k].tex, prev = g_snap[pk].tex, prev2 = prev;   // prev2: the present before prev, when a ring slot holds it (fgmv_pstill)
     for (int i = 0; i < g_snap_n; i++) if (i != k && i != pk && g_snap[i].seq + 2 == g_snap[k].seq && g_snap[i].tex.width == col.width && g_snap[i].tex.height == col.height && g_snap[i].tex.pixelFormat == col.pixelFormat) prev2 = g_snap[i].tex;
+    *(uint32_t *)g_fg_sw.contents = (uint32_t)fg_cut_on();
     id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
     [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:resource_vis()];   // after MetalFX's encoders
     [ce setArgumentTable:g_fgmv_args];
+    fgmv_bind(ce, FGMV_CUT, g_fg_tiles, g_fg_flags, nil, nil); [g_fgmv_args setAddress:g_fg_sw.gpuAddress atIndex:0];   // first: fgmv_still reads its part
+    [ce dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)]; fgmv_step(ce);
     fgmv_bind(ce, FGMV_STILL, col, prev, g_fg_still, nil); fgmv_grid(ce, g_fg_still.width, g_fg_still.height); fgmv_step(ce);
     fgmv_bind(ce, FGMV_CONF, g_snap[k].lum, g_snap[pk].lum, g_fg_motion, g_fg_conf); fgmv_grid(ce, g_fg_conf.width, g_fg_conf.height); fgmv_step(ce);
-    fgmv_bind(ce, FGMV_HUD, g_fg_still, g_fg_keep, g_fg_conf, nil); fgmv_grid(ce, g_fg_keep.width, g_fg_keep.height); fgmv_step(ce);
+    fgmv_bind(ce, FGMV_HUD, g_fg_still, g_fg_keep, g_fg_conf, g_fg_flags); [g_fgmv_args setAddress:g_fg_sw.gpuAddress atIndex:0];
+    fgmv_grid(ce, g_fg_keep.width, g_fg_keep.height); fgmv_step(ce);
     fgmv_bind(ce, FGMV_PSTILL, col, prev, prev2, g_fg_pmask); fgmv_grid(ce, col.width, col.height); fgmv_step(ce);
     fgmv_bind(ce, FGMV_KEEP, col, g_fg_keep, gen, g_fg_pmask); [g_fgmv_args setTexture:g_fg_motion.gpuResourceID atIndex:4]; fgmv_grid(ce, gen.width, gen.height);
     [ce barrierAfterStages:MTLStageDispatch beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the present reads gen

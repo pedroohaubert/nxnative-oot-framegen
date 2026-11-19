@@ -85,6 +85,218 @@ static int size_case(void) {
     mtl_drain();
     printf("frame generation size: %d checks, %d failed\n", checks, failed); return failed != 0;
 }
+// The cut guard (DM_FRAMEGEN_CUT): a cut's pair shows the present's own picture instead of a frame invented between two scenes, with its guard on and off over the same
+// pair. A line of text replaced with the picture standing still is measured beside it (no guard for it: docs/reference/frame-rate.md), and a square moving over that
+// standing picture stays with the interpolator
+enum { GW = 960, GH = 540 };
+// kind 0 / 1: a cut's two scenes (a bright gradient with dark boxes against a dark one with a bright band: no offset of one matches anything in the other)
+// kind 2: a picture that stands still but for a bright square at 120 + off (96x96), the same ground as 10 and 11
+// kind 10 / 11: one standing picture whose line of text (300..660 x 300..336) is other glyphs in the other kind
+static void g_px(int kind, int off, int x, int y, uint8_t *p) {
+    float l;
+    if (kind < 2) {
+        if (kind == 0) {
+            l = 0.15f + 0.7f * x / GW;
+            if (x > 60 && x < 260 && y > 80 && y < 200) l = 0.05f;
+            if (x > 600 && x < 700 && y > 300 && y < 480) l = 0.95f;
+        } else {
+            l = 0.9f - 0.75f * y / GH;
+            if (x > 200 && x < 520 && y > 380 && y < 460) l = 0.98f;
+            if (x > 700 && x < 900 && y > 60 && y < 240) l = 0.03f;
+        }
+    } else {
+        l = 0.22f + 0.06f * (((x / 24) + (y / 24)) & 1);   // the ground both pictures share: a faint checker and a fixed post
+        if (x > 300 && x < 340) l = 0.05f;
+        if (kind == 2 && x >= 120 + off && x < 216 + off && y >= 220 && y < 316) l = 0.95f;
+        if (y >= 300 && y < 336 && x >= 300 && x < 660) {   // a dialogue box: the dark panel is the same in both kinds, its line of text is not
+            l = 0.02f;
+            if (kind > 2 && y >= 304 && y < 332 && x >= 304 && x < 656) {   // glyphs of 12 px, a stroke 2 or 3 px wide at one of 6 places in each (inset from the panel)
+                unsigned h = (unsigned)(x / 12) * 2246822519u ^ (unsigned)((y - 304) / 14) * 3266489917u ^ (unsigned)kind * 668265263u;
+                h = (h ^ (h >> 13)) * 1274126177u;
+                int sx = (int)((h >> 8) % 6), sw = 2 + (int)((h >> 16) & 1), gx = x - (x / 12) * 12;
+                if (gx >= sx * 2 && gx < sx * 2 + sw) l = 0.97f;
+            }
+        }
+    }
+    p[0] = p[1] = p[2] = (uint8_t)fminf(255, l * 255 + 0.5f); p[3] = 255;
+}
+static uint8_t *g_image(int kind, int off) {
+    uint8_t *p = malloc(GW * GH * 4);
+    for (int y = 0; y < GH; y++) for (int x = 0; x < GW; x++) g_px(kind, off, x, y, p + 4 * (y * GW + x));
+    return p;
+}
+static tex_t g_tex(int kind, int off, int i) {
+    uint8_t *p = g_image(kind, off);
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:GW height:GH mipmapped:NO];
+    d.storageMode = MTLStorageModeShared; d.usage = MTLTextureUsageShaderRead; id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d];
+    [mt replaceRegion:MTLRegionMake2D(0, 0, GW, GH) mipmapLevel:0 withBytes:p bytesPerRow:GW * 4]; free(p);
+    tex_t t = {.magic=MAGIC('T','E','X',0), .serial=96001+(uint64_t)i};
+    t.d.width = GW; t.d.height = GH; t.d.depth = t.d.levels = t.d.samples = 1;
+    t.d.target = NVN_TEXTURE_TARGET_2D; t.d.format = NVN_FORMAT_RGBA8; serial_put(t.serial, mt); res_add(mt); res_commit(); return t;
+}
+static int g_present(int kind, int off, int *i) {
+    tex_t t = g_tex(kind, off, (*i)++); present_enqueue(&t, 1 / 30.0, NULL, 0, NULL); mtl_present_flush(); copied(); return last_slot();
+}
+static float g_half(uint16_t h) {   // a half as a float (fgmv_cut's flags)
+    int e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    float v = e == 0 ? m / 1024.0f / 16384.0f : (1 + m / 1024.0f) * powf(2, e - 15);
+    return h >> 15 ? -v : v;
+}
+static void g_flags(float v[4]) {
+    id<MTLBuffer> out = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:g_fg_flags sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(1, 1, 1) toBuffer:out destinationOffset:0 destinationBytesPerRow:8 destinationBytesPerImage:8];
+    [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    const uint16_t *h = out.contents; for (int i = 0; i < 4; i++) v[i] = g_half(h[i]);
+}
+static uint8_t *g_grab(id<MTLTexture> t) {
+    id<MTLBuffer> out = [g_dev newBufferWithLength:t.width * t.height * 4 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(t.width, t.height, 1) toBuffer:out destinationOffset:0
+        destinationBytesPerRow:t.width * 4 destinationBytesPerImage:t.width * t.height * 4];
+    [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    uint8_t *p = malloc(t.width * t.height * 4); memcpy(p, out.contents, t.width * t.height * 4); return p;
+}
+// Of the pixels the pair changed (more than 32 in a channel), the ones the generated frame took from the present unchanged (within 2)
+static void g_kept(const char *what, id<MTLTexture> gen, uint8_t *cur, uint8_t *prev, double *part, double *same) {
+    if (!gen) { *part = *same = 0; return; }
+    uint8_t *g = g_grab(gen); long n = 0, s = 0;
+    for (int k = 0; k < GW * GH; k++) { int o = 4 * k;
+        if (abs(cur[o] - prev[o]) <= 32 && abs(cur[o + 1] - prev[o + 1]) <= 32 && abs(cur[o + 2] - prev[o + 2]) <= 32) continue;
+        n++; if (abs(g[o] - cur[o]) <= 2 && abs(g[o + 1] - cur[o + 1]) <= 2 && abs(g[o + 2] - cur[o + 2]) <= 2) s++; }
+    *part = n / (double)(GW * GH); *same = n ? s / (double)n : 0;
+    printf("guards: %s: %ld of the picture's pixels changed, %ld of them the present's own\n", what, n, s);
+    free(g);
+}
+// Where the changed pixels the generated frame left to the interpolator sit (a measurement): the fgmv_still value of their block, whether fgmv_hud left them to the
+// interpolator, and the motion found at their 1/8 cell
+static void g_miss(const char *what, id<MTLTexture> gen, uint8_t *cur, uint8_t *prev) {
+    if (!gen) return;
+    long bw = g_fg_still.width, bh = g_fg_still.height, nb = bw * bh, mw = g_fg_motion.width, mh = g_fg_motion.height;
+    id<MTLBuffer> os = [g_dev newBufferWithLength:nb * 2 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ok = [g_dev newBufferWithLength:nb * 2 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> om = [g_dev newBufferWithLength:mw * mh * 8 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    for (int i = 0; i < 2; i++) {
+        id<MTLTexture> t = i ? g_fg_keep : g_fg_still; id<MTLBuffer> o = i ? ok : os;
+        [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(bw, bh, 1) toBuffer:o destinationOffset:0
+            destinationBytesPerRow:bw * 2 destinationBytesPerImage:nb * 2];
+    }
+    [b copyFromTexture:g_fg_motion sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(mw, mh, 1) toBuffer:om destinationOffset:0
+        destinationBytesPerRow:mw * 8 destinationBytesPerImage:mw * mh * 8];
+    [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    uint8_t *g = g_grab(gen); const uint16_t *st = os.contents, *kp = ok.contents, *mt = om.contents;
+    long b0 = 0, b1 = 0, b2 = 0, b3 = 0, kz = 0, mv = 0;
+    for (int y = 0; y < GH; y++) for (int x = 0; x < GW; x++) { int o = 4 * (y * GW + x), d = 0;
+        for (int c = 0; c < 3; c++) { int e = abs(cur[o + c] - prev[o + c]); if (e > d) d = e; }
+        if (d <= 32) continue;
+        if (abs(g[o] - cur[o]) <= 2 && abs(g[o + 1] - cur[o + 1]) <= 2 && abs(g[o + 2] - cur[o + 2]) <= 2) continue;
+        float v = g_half(st[((long)y * bh / GH) * bw + (long)x * bw / GW]);
+        if (v > 2.5f) b3++; else if (v > 1.5f) b2++; else if (v > 0.5f) b1++; else b0++;
+        if (g_half(kp[((long)y * bh / GH) * bw + (long)x * bw / GW]) < 0.25f) kz++;
+        long mi = ((long)y * mh / GH) * mw + (long)x * mw / GW;
+        float vx = g_half(mt[4 * mi]), vy = g_half(mt[4 * mi + 1]);
+        if (sqrtf(vx * vx + vy * vy) > 0.5f) mv++; }
+    printf("guards: %s: changed pixels left to the interpolator %ld, in a block fgmv_still 0 %ld, 1 %ld, 2 %ld, 3 %ld; fgmv_hud left them to the interpolator %ld; a motion at their 1/8 cell %ld\n",
+           what, b0 + b1 + b2 + b3, b0, b1, b2, b3, kz, mv);
+    free(g);
+}
+// Four presents of one picture (the interpolator's history) and then one of the other: the generated frame of that pair. off: the moving square's offset in the kind 2 picture
+static int g_pair(int a, int b, int oa, int ob, int *i) { for (int k = 0; k < 4; k++) g_present(a, oa, i); return g_present(b, ob, i); }
+// The motion search's tiles as fgmv_cut reads them (a measurement): over the tiles with something to match, their mean confidence, and the tiles whose best
+// offset still leaves a change, with theirs (this is the pair of numbers the cut's thresholds sit between)
+static void g_tiles(const char *what) {
+    long nt = g_fg_tiles.width * g_fg_tiles.height, n = 0, ch = 0; double cs = 0, bs = 0, mx = 0;
+    id<MTLBuffer> out = [g_dev newBufferWithLength:nt * 8 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:g_fg_tiles sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(g_fg_tiles.width, g_fg_tiles.height, 1) toBuffer:out destinationOffset:0
+        destinationBytesPerRow:g_fg_tiles.width * 8 destinationBytesPerImage:nt * 8];
+    [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    const uint16_t *h = out.contents;
+    for (long i = 0; i < nt; i++) {
+        float vx = g_half(h[4 * i]), vy = g_half(h[4 * i + 1]), c = g_half(h[4 * i + 2]), m = g_half(h[4 * i + 3]);
+        if (m < 0.01f) continue;
+        n++; cs += c; mx = fmax(mx, fmaxf(fabsf(vx), fabsf(vy)));
+        if (m * (1 - c) >= 0.015f) { ch++; bs += c; }
+    }
+    printf("guards: %s: %ld of %ld tiles with detail, their mean confidence %.2f; %ld of them changed, theirs %.2f; largest tile motion %.1f\n",
+           what, n, nt, n ? cs / n : 0, ch, ch ? bs / ch : 0, mx);
+}
+// The still blocks fgmv_hud decides on (a measurement): how many changed (0), are still (1), still with detail (2), changed with detail (3)
+static void g_st(const char *what) {
+    long n = g_fg_still.width * g_fg_still.height, c[4] = {0, 0, 0, 0};
+    id<MTLBuffer> out = [g_dev newBufferWithLength:n * 2 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:g_fg_still sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(g_fg_still.width, g_fg_still.height, 1) toBuffer:out destinationOffset:0
+        destinationBytesPerRow:g_fg_still.width * 2 destinationBytesPerImage:n * 2];
+    [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    const uint16_t *h = out.contents;
+    for (long i = 0; i < n; i++) { float v = g_half(h[i]); c[v > 2.5f ? 3 : v > 1.5f ? 2 : v > 0.5f ? 1 : 0]++; }
+    printf("guards: %s: blocks changed %ld, still %ld, still with detail %ld, changed with detail %ld (of %ld)\n", what, c[0], c[1], c[2], c[3], n);
+}
+// Whether the ring slot's own picture is the one the test drew, and what the pair the generated frame was made from really holds (a measurement)
+static void g_dbg(const char *what, int kind) {
+    int k = last_slot(), pk = (int)((g_snap_next + (uint64_t)g_snap_n - 2) % (uint64_t)g_snap_n);
+    uint8_t *a = g_grab(g_snap[k].tex), *b = g_image(kind, 0), *c = g_grab(g_snap[pk].tex);
+    long d1 = 0, d2 = 0, d3 = 0;
+    for (long n = 0; n < GW * GH; n++) {
+        if (abs(a[4 * n] - b[4 * n]) > 2) d1++;
+        if (abs(a[4 * n] - c[4 * n]) > 2) d2++;
+        if (abs(a[4 * n] - c[4 * n]) > 32) d3++;
+    }
+    printf("guards: %s: gen %lux%lu; slot %d vs the picture drawn %ld px differ; vs the slot before (k %d, %dx%d) %ld px differ, %ld by more than 32; gen_ok %d seq %llu/%llu\n",
+           what, (unsigned long)g_snap[k].gen.width, (unsigned long)g_snap[k].gen.height, k, d1, pk, (int)g_snap[pk].tex.width, (int)g_snap[pk].tex.height, d2, d3, g_snap[k].gen_ok,
+           (unsigned long long)g_snap[k].seq, (unsigned long long)g_snap[pk].seq);
+    free(a); free(b); free(c);
+}
+// The blocks fgmv_hud decided on (a measurement): how many take the present's own pixels, half the step, the interpolator's
+static void g_keep_dump(const char *what) {
+    long n = g_fg_keep.width * g_fg_keep.height, c[3] = {0, 0, 0};
+    id<MTLBuffer> out = [g_dev newBufferWithLength:n * 2 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b copyFromTexture:g_fg_keep sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(g_fg_keep.width, g_fg_keep.height, 1) toBuffer:out destinationOffset:0
+        destinationBytesPerRow:g_fg_keep.width * 2 destinationBytesPerImage:n * 2];
+    [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    const uint16_t *h = out.contents;
+    for (long i = 0; i < n; i++) { float v = g_half(h[i]); c[v > 0.75f ? 0 : v > 0.25f ? 1 : 2]++; }
+    printf("guards: %s: blocks the present's own %ld, half the step %ld, the interpolator's %ld (of %ld)\n", what, c[0], c[1], c[2], n);
+}
+static int guards_case(void) {
+    setenv("DM_FRAMEGEN", "1", 1); setenv("DM_PRESENT_SNAP", "1", 1); setenv("DM_PRESENT_HZ", "0", 1); setenv("DM_PRESENT_LINK", "0", 1);
+    mtl_init();
+    g_test_layer = [CAMetalLayer layer]; g_test_layer.device = g_dev; g_test_layer.drawableSize = CGSizeMake(GW, GH); g_test_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    mtl_present_screen(GW, GH); mtl_present_layer(GW, GH);
+    CHECK("frame generation on", fg_on());
+    CHECK("the cut guard is on by default", fg_cut_on());
+    int i = 0, k; double part, same; float fl[4];
+    uint8_t *ca = g_image(0, 0), *cb = g_image(1, 0), *ta = g_image(10, 0), *tb = g_image(11, 0);
+    // A cut: the generated frame is the present's own picture, and the flags say which pair was one
+    k = g_pair(0, 1, 0, 0, &i); g_flags(fl); g_kept("cut pair", g_snap[k].gen, cb, ca, &part, &same); g_tiles("cut pair"); g_st("cut pair"); g_keep_dump("cut pair"); g_dbg("cut pair", 1);
+    printf("guards: cut pair, guard on: flags %.2f, %.0f %% of the picture changed (%.0f %% of its pixels), mean confidence %.2f; %.1f %% of the changed picture the present's own\n",
+           fl[0], 100 * fl[1], 100 * part, fl[2], 100 * same);
+    CHECK("a cut is found, and most of its picture changed with the search explaining none of it", fl[0] > 0.5f && fl[1] > 0.5f && fl[2] < 0.75f);
+    CHECK("a cut's generated frame is the present's own picture", part > 0.5 && same > 0.98);
+    g_fg_guard_cut = 0; k = g_pair(0, 1, 0, 0, &i); g_flags(fl); g_kept("cut pair", g_snap[k].gen, cb, ca, &part, &same);
+    printf("guards: cut pair, guard off: flags %.2f, %.1f %% of the changed picture the present's own\n", fl[0], 100 * same);
+    CHECK("a cut with its guard off is the interpolator's picture again", fl[0] < 0.5f && same < 0.95);
+    g_fg_guard_cut = 1;
+    // A line of text replaced while the picture stands still (a measurement, no guard for it: docs/reference/frame-rate.md). It is not a cut, and the interpolator's
+    // mix of the two texts is what the generated frame holds, which is the case a text guard could not take without also taking a moving surface's leading edge
+    k = g_pair(10, 11, 0, 0, &i); g_flags(fl); g_kept("text pair", g_snap[k].gen, tb, ta, &part, &same); g_tiles("text pair"); g_st("text pair"); g_keep_dump("text pair"); g_dbg("text pair", 11); g_miss("text pair", g_snap[k].gen, tb, ta);
+    printf("guards: text pair: flags %.2f, %.0f %% of the picture changed, mean confidence %.2f; %.1f %% of the changed pixels the present's own\n", fl[0], 100 * fl[1], fl[2], 100 * same);
+    CHECK("replaced text is not a cut", fl[0] < 0.5f && fl[1] < 0.25f);
+    CHECK("replaced text is still the interpolator's mix of the two texts", part > 0.005 && same < 0.5);
+    // The same standing picture with a bright square moving 32 px a present: not a cut, and the square's own change stays with the interpolator, its tile's motion not
+    // being none (the picture stands still, the guard's gate on how much of it changed passes)
+    uint8_t *ma = g_image(2, 0), *mb = g_image(2, 32);
+    k = g_pair(2, 2, 0, 32, &i); g_flags(fl); g_kept("moving square", g_snap[k].gen, mb, ma, &part, &same); g_tiles("moving square"); g_st("moving square"); g_keep_dump("moving square"); g_dbg("moving square", 2); g_miss("moving square", g_snap[k].gen, mb, ma);
+    printf("guards: moving square, guards on: flags %.2f, %.0f %% of the picture changed; %.0f %% of its change the present's own\n", fl[0], 100 * fl[1], 100 * same);
+    CHECK("a square moving over a standing picture is not a cut", fl[0] < 0.5f && fl[1] < 0.25f);
+    CHECK("a moving square's change stays with the interpolator", part > 0.005 && same < 0.5);
+    free(ca); free(cb); free(ta); free(tb); free(ma); free(mb);
+    mtl_drain();
+    printf("frame generation guards: %d checks, %d failed\n", checks, failed); return failed != 0;
+}
 // "t_framegen stab": how steady generated frames are (a measurement, it reports and fails nothing). A detailed scene (value noise of three scales, colour) pans at a steady
 // SPEED px a frame and then a fast one, under an opaque HUD (top left: a box of glyph-like bars) and a half-transparent panel (bottom right, the scene through it, with
 // bars in it). Each generated frame is scored against the ideal halfway picture (the scene at the mean of the two offsets, the HUD as it is): mean error on the scene,
@@ -164,6 +376,9 @@ static int stab_case(void) {
 int main(int argc, char **argv) { @autoreleasepool {
     if (argc > 1 && !strcmp(argv[1], "size")) return size_case();
     if (argc > 1 && !strcmp(argv[1], "stab")) return stab_case();
+    if (argc > 1 && !strcmp(argv[1], "guards")) return guards_case();
+    // "fusion": the run below with the cut guard off, as the frames were generated before it (every case of it must come out the same)
+    if (argc > 1 && !strcmp(argv[1], "fusion")) setenv("DM_FRAMEGEN_CUT", "0", 1);
     alarm(90); setbuf(stdout, NULL);
     setenv("DM_FRAMEGEN", "1", 1); setenv("DM_PRESENT_SNAP", "1", 1); setenv("DM_PRESENT_HZ", "0", 1); setenv("DM_PRESENT_LINK", "0", 1);   // the present thread first; the link's ticks are called below
     mtl_init();
