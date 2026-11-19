@@ -303,7 +303,7 @@ static int guards_case(void) {
 // opened with load and no depth that draw the HUD into the same picture. The frame's *last* such pass is the one whose picture the mask compares — the one
 // before it already holds the HUDs drawn before it — a pass whose draw depth-tests is not one, a present that does not show the picture 1:1 gets no mask, a
 // picture the UI covers whole is shown as drawn, and with the mask off nothing changes. The world moves, so a mask taken from another frame would show it.
-enum { UW = 384, UH = 216, UBW = UW / 4, UBH = UH / 4 };   // the picture, and the mask's grid: 96x54 blocks
+enum { UW = 384, UH = 216, UBW = UW / 4, UBH = UH / 4, HW = UW / 2, HH = UH / 2 };   // the picture, its mask grid (96x54 blocks), and a game picture half of it
 static tex_t g_ui_win; static prog_t g_ui_prog;
 static uint8_t g_ui_cmd[1 << 16]; static size_t g_ui_used;
 static void u_emit(unsigned op, const void *p, size_t n) {
@@ -312,22 +312,37 @@ static void u_emit(unsigned op, const void *p, size_t n) {
 }
 // One pass: the world's (band >= 0) clears the picture and draws a bright band at band (the world's own motion), a UI pass draws the HUD's rectangle over the
 // picture it loads. dt: the draw depth-tests and writes, as a game's own pass that is not its UI one does (the pass is not confirmed).
-static void u_pass(int band, const int hud[4], int dt) {
-    p_set_rt rt = {.n = 1}; rt.color[0] = &g_ui_win; u_emit(OP_SET_RT, &rt, sizeof rt);
+static int g_ui_view;   // 1: the passes attach a view of the whole texture (level 0, its own format), as a game's own do
+static void u_pass_at(int band, const int hud[4], int dt, const tex_t *t, int k) {   // k: the target's size over the presented picture's (2: half)
+    p_set_rt rt = {.n = 1}; rt.color[0] = t; if (g_ui_view) rt.has_cview[0] = 1; u_emit(OP_SET_RT, &rt, sizeof rt);
     p_bind_program bp = {.prog = &g_ui_prog, .stages = 3}; u_emit(OP_BIND_PROGRAM, &bp, sizeof bp);
-    if (band >= 0) { p_scissor full = {0, 0, UW, UH}; u_emit(OP_SCISSOR, &full, sizeof full);   // the clear covers the picture: a load action, as a game clears with
+    if (band >= 0) { p_scissor full = {0, 0, (int)t->d.width, (int)t->d.height}; u_emit(OP_SCISSOR, &full, sizeof full);   // the clear covers the picture: a load action, as a game clears with
         p_clear_color cc = {.index = 0, .mask = 15, .rgba = {0.16f, 0.16f, 0.2f, 1}}; u_emit(OP_CLEAR_COLOR, &cc, sizeof cc); }
     ds_st ds = {.dt = dt != 0, .dw = dt != 0, .df = NVN_DEPTH_FUNC_ALWAYS};
     p_bind_state bs = {.kind = 5}; memcpy(bs.bytes, &ds, sizeof ds); u_emit(OP_BIND_STATE, &bs, sizeof bs);
-    p_scissor sc = band >= 0 ? (p_scissor){band, 76, 40, 44} : (p_scissor){hud[0], hud[1], hud[2], hud[3]}; u_emit(OP_SCISSOR, &sc, sizeof sc);
+    p_scissor sc = band >= 0 ? (p_scissor){band / k, 76 / k, 40 / k, 44 / k} : (p_scissor){hud[0] / k, hud[1] / k, hud[2] / k, hud[3] / k};
+    u_emit(OP_SCISSOR, &sc, sizeof sc);
     p_draw d = {.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = 3, .instances = 1}; u_emit(OP_DRAW, &d, sizeof d);
 }
+static void u_pass(int band, const int hud[4], int dt) { u_pass_at(band, hud, dt, &g_ui_win, 1); }
 // A frame: the world at band, then the UI passes of hud_a and hud_b (each its own pass, as the game opens them), one submission
 static void u_frame(int band, const int *hud_a, const int *hud_b, int dt) {
     mtl_sub_begin();
     { g_ui_used = 0; u_pass(band, NULL, 0); u_emit(OP_END, NULL, 0); mtl_exec(g_ui_cmd); rp_end(); }
     if (hud_a) { g_ui_used = 0; u_pass(-1, hud_a, 0); u_emit(OP_END, NULL, 0); mtl_exec(g_ui_cmd); rp_end(); }
     if (hud_b) { g_ui_used = 0; u_pass(-1, hud_b, dt); u_emit(OP_END, NULL, 0); mtl_exec(g_ui_cmd); rp_end(); }
+    if (!mtl_wait(mtl_sub_commit(), 5000000000ull)) { printf("ui: the frame's GPU work did not complete\n"); failed++; }
+}
+// The same picture at two sizes: the game draws its world and its HUD into its own picture (half the presented one, as an internal resolution under a
+// present's own scale) and the presented picture holds the same content at its size. The mask has to map a block of the presented picture to the same
+// place in the game's own — fgmv_uimask reads each at its own size
+static tex_t g_ui_small;
+static void u_frame_two(int band, const int hud[4]) {
+    mtl_sub_begin();
+    g_ui_used = 0; u_pass_at(band, NULL, 0, &g_ui_win, 1); u_emit(OP_END, NULL, 0); mtl_exec(g_ui_cmd); rp_end();     // the world, at the presented size
+    g_ui_used = 0; u_pass_at(band, NULL, 0, &g_ui_small, 2); u_emit(OP_END, NULL, 0); mtl_exec(g_ui_cmd); rp_end();   // and in the game's own
+    g_ui_used = 0; u_pass_at(-1, hud, 0, &g_ui_win, 1); u_emit(OP_END, NULL, 0); mtl_exec(g_ui_cmd); rp_end();        // the HUD the screen shows
+    g_ui_used = 0; u_pass_at(-1, hud, 0, &g_ui_small, 2); u_emit(OP_END, NULL, 0); mtl_exec(g_ui_cmd); rp_end();      // the UI pass of the game's own picture: the pair's boundary
     if (!mtl_wait(mtl_sub_commit(), 5000000000ull)) { printf("ui: the frame's GPU work did not complete\n"); failed++; }
 }
 static int u_present(const int crop[4]) {   // present the picture the passes drew; returns its ring slot
@@ -373,6 +388,13 @@ static int ui_case(void) {
       g_ui_win = (tex_t){.magic = MAGIC('T','E','X',0), .serial = 97001};
       g_ui_win.d = (nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8, .width = UW, .height = UH, .depth = 1, .levels = 1, .samples = 1};
       serial_put(g_ui_win.serial, mt); res_add(mt); res_commit(); }
+    // The game's own picture, half the presented one: its internal resolution under the present's own scale (fgmv_uimask maps each at its own size)
+    { MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:HW height:HH mipmapped:NO];
+      d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+      id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d]; if (!mt) return 2;
+      g_ui_small = (tex_t){.magic = MAGIC('T','E','X',0), .serial = 97003};
+      g_ui_small.d = (nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8, .width = HW, .height = HH, .depth = 1, .levels = 1, .samples = 1};
+      serial_put(g_ui_small.serial, mt); res_add(mt); res_commit(); }
     { NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
           "vertex float4 v(uint n [[vertex_id]]) { float2 p[3] = {float2(-1,-1), float2(3,-1), float2(-1,3)}; return float4(p[n % 3], 0, 1); }\n"
           "fragment float4 f() { return float4(0.94, 0.93, 0.86, 1); }\n" options:nil error:&e];
@@ -394,7 +416,7 @@ static int ui_case(void) {
       float ca = u_cov(m, bw, bh, hud_a), cb = u_cov(m, bw, bh, hud_b);
       const int wband[4] = {band, 76, 40, 44}; float cw = u_cov(m, bw, bh, wband), all = u_all(m, bw, bh);
       printf("ui: the mask covers %.2f of the first pass's HUD, %.2f of the last one's, %.2f of the world's band; %.1f %% of the picture in all\n", ca, cb, cw, 100 * all);
-      CHECK("the last UI pass of the frame is the boundary: its HUD is in the mask, the earlier one is not", cb > 0.75f && ca < 0.1f);
+      CHECK("consecutive UI passes on the same target are both in the mask (not lost by the second pass)", cb > 0.75f && ca > 0.75f);
       CHECK("the world's own change is not in the mask", cw < 0.1f);
       CHECK("the mask covers a part of the picture, not all of it", all > 0.02f && all < 0.2f);
       free(m); }
@@ -424,15 +446,51 @@ static int ui_case(void) {
       printf("ui: a frame with no UI pass: the mask covers %.3f of the picture\n", all);
       CHECK("a frame with no UI pass gets a mask of zeros", all == 0);
       free(m); }
-    // A present that does not show the picture 1:1 (a crop of its left half): no mask at all, the frames of before
+    // A present that shows only part of the picture (a crop of its left half): its aspect is not the target's, so no mask at all — the frames of before,
+    // never a mask from the wrong picture
     for (int i = 0; i < 4; i++, band += 24) { u_frame(band, hud_a, NULL, 0); u_present(NULL); }
     { const int half[4] = {0, 0, UW / 2, UH};
       band += 24; u_frame(band, hud_a, hud_b, 0); k = u_present(half);
       m = u_mask(&bw, &bh); float all = u_all(m, bw, bh);
       printf("ui: a cropped present: the mask covers %.3f of the picture\n", all);
-      CHECK("a present that does not show the picture 1:1 gets no mask", all == 0);
+      CHECK("a present that does not show the picture whole gets no mask", all == 0);
       free(m); }
     for (int i = 0; i < 4; i++, band += 24) { u_frame(band, hud_a, hud_b, 0); u_present(NULL); }   // the picture back at its size
+    // The game's own picture half the presented one (its internal resolution under the present's own scale): the mask maps a block of the screen's picture
+    // to the same place in the game's, and the generated HUD is still the present's own pixels
+    for (int i = 0; i < 4; i++, band += 24) { u_frame_two(band, hud_a); u_present(NULL); }
+    band += 24; u_frame_two(band, hud_b); k = u_present(NULL);
+    { const int wband[4] = {band, 76, 40, 44};
+      m = u_mask(&bw, &bh);
+      float cb = u_cov(m, bw, bh, hud_b), ca = u_cov(m, bw, bh, hud_a), cw2 = u_cov(m, bw, bh, wband), all = u_all(m, bw, bh);
+      printf("ui: a game picture half the screen's: the mask covers %.2f of the last HUD, %.2f of the first, %.2f of the world's band; %.1f %% in all\n", cb, ca, cw2, 100 * all);
+      CHECK("a UI target at another size than the screen's is mapped block for block", cb > 0.7f && ca < 0.1f && cw2 < 0.1f && all > 0.02f && all < 0.2f);
+      free(m); }
+    { uint8_t *cur = g_grab(g_snap[k].tex), *gen = g_grab(g_snap[k].gen); long n = 0, same = 0; if (!cur || !gen) { printf("ui: no readback\n"); return 2; }
+      for (int y = hud_b[1]; y < hud_b[1] + hud_b[3]; y++) for (int x = hud_b[0]; x < hud_b[0] + hud_b[2]; x++) {
+          int o = 4 * (y * UW + x); n++;
+          if (abs(gen[o] - cur[o]) <= 2 && abs(gen[o + 1] - cur[o + 1]) <= 2 && abs(gen[o + 2] - cur[o + 2]) <= 2) same++; }
+      printf("ui: at the other size, the generated frame at the HUD: %ld of %ld pixels the present's own\n", same, n);
+      CHECK("at the other size the HUD of the generated frame is the present's own", same > 0.85 * n);
+      free(cur); free(gen); }
+    band = 40;
+    // The target's size changes between frames, as the dynamic resolution steps it: the mask is made again for the new size, never the one before
+    for (int i = 0; i < 4; i++, band += 24) { u_frame(band, hud_a, NULL, 0); u_present(NULL); }
+    for (int i = 0; i < 4; i++, band += 24) { u_frame_two(band, hud_b); u_present(NULL); }
+    band += 24; u_frame(band, hud_a, hud_b, 0); k = u_present(NULL);   // back to the picture the passes draw at the screen's size
+    { m = u_mask(&bw, &bh); float cb = u_cov(m, bw, bh, hud_b), ca = u_cov(m, bw, bh, hud_a);
+      printf("ui: the target back at the screen's size: %.2f of the last HUD, %.2f of the first\n", cb, ca);
+      CHECK("a target that changes size between frames is learned again for the new size", cb > 0.7f && ca > 0.7f);
+      free(m); }
+    // A pass that attaches a view of the whole texture (level 0, its own format) is still the game's UI pass: the view is not a reason to refuse it
+    g_ui_view = 1;
+    for (int i = 0; i < 4; i++, band += 24) { u_frame(band, hud_a, NULL, 0); u_present(NULL); }
+    band += 24; u_frame(band, hud_a, hud_b, 0); k = u_present(NULL);
+    { m = u_mask(&bw, &bh); float cb = u_cov(m, bw, bh, hud_b), all = u_all(m, bw, bh);
+      printf("ui: with a view of the whole texture: %.2f of the last HUD, %.1f %% of the picture\n", cb, 100 * all);
+      CHECK("a view that changes neither level, layers nor format is not a reason to refuse the pass", cb > 0.7f && all > 0.02f);
+      free(m); }
+    g_ui_view = 0;
     // A UI that covers the picture whole (a menu, a fade): counted as no generation, the frames after it shown as drawn
     { const int whole[4] = {0, 0, UW, UH};
       band += 24; u_frame(band, hud_a, whole, 0); k = u_present(NULL);

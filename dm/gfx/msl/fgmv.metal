@@ -254,15 +254,20 @@ kernel void fgmv_pstill(texture2d<float, access::read> cur [[texture(0)]], textu
 kernel void fgmv_uimask(texture2d<float, access::read> shown [[texture(0)]], texture2d<float, access::read> hudless [[texture(1)]],
                         texture2d<half, access::write> mask [[texture(2)]], uint2 g [[thread_position_in_grid]]) {
     if (g.x >= mask.get_width() || g.y >= mask.get_height()) return;
-    uint2 m = uint2(mask.get_width(), mask.get_height()), s = uint2(shown.get_width(), shown.get_height());
-    int2 mx = int2(s) - 1, o = int2((g * s) / m);   // the 6x6 window at the block's foot: the picture is 5.33 texels a block at 1920x1080 and a 360x203 grid
-    int n = 0;
-    for (int y = 0; y < 6; y++) for (int x = 0; x < 6; x++) {
-        uint2 p = uint2(clamp(o + int2(x, y), int2(0), mx));   // clamped at the picture's edge, where the window runs past it
-        float3 e = fabs(shown.read(p).rgb - hudless.read(p).rgb);
+    // The two pictures are the same one at two sizes: the one the screen shows (the present's copy, in the generated frame's own size) and the game's own,
+    // where its UI pass drew (its internal resolution, which the dynamic resolution steps). A block is 4x4 of the generated frame; its texels are compared
+    // with the same place in the game's picture, mapped by each one's own size — no shared factor, so neither 1920x1080 nor 1280x720 against 1440x810 is
+    // sampled in the wrong place
+    uint2 m = uint2(mask.get_width(), mask.get_height()), s = uint2(shown.get_width(), shown.get_height()), h = uint2(hudless.get_width(), hudless.get_height());
+    uint2 b0 = (g * s) / m, b1 = ((g + 1) * s + m - 1) / m;   // the block's first texel and one past its last
+    int w = max(1, (int)(b1.x - b0.x)), hh = max(1, (int)(b1.y - b0.y)), n = 0;
+    for (int y = 0; y < hh; y++) for (int x = 0; x < w; x++) {
+        uint2 ps = min(b0 + uint2(x, y), s - 1);
+        uint2 ph = min((ps * h) / s, h - 1);
+        float3 e = fabs(shown.read(ps).rgb - hudless.read(ph).rgb);
         if (max(e.x, max(e.y, e.z)) > FGMV_UI_DIFF) n++;
     }
-    mask.write(half4(half(float(n) / 36.0f)), g);
+    mask.write(half4(half(float(n) / float(w * hh))), g);
 }
 // The part of the picture the mask covers (fg_ui_take, read back with the snapshot's commit): past FG_UI_BLANK the frame is shown as drawn, as in the game's
 // menus (a menu, a fade, a game that composes its UI as one full-screen quad), and the interpolation is not paid for. Not on the CPU before the frame: nothing
