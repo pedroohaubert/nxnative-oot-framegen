@@ -5,6 +5,7 @@
 // app without the game. "Show this window at launch" off: no window unless Option is held at launch, and launcher.c applies the saved choices. The window never takes focus by itself: an app
 // opened in the background (open -g) keeps its window behind until the player switches to it
 import AppKit
+import AVFAudio
 import QuartzCore
 import SwiftUI
 
@@ -345,6 +346,31 @@ enum LauncherWindowLayout {
         let height = min(frame.height + extraHeight, top - visible.minY)
         return NSRect(x: frame.minX, y: top - height, width: frame.width, height: height)
     }
+}
+
+// Called on the main thread after settings and cloud-save decisions. The OS can present
+// its consent alert even when the settings window is suppressed.
+@_cdecl("dm_mac_microphone_consent")
+public func dmMacMicrophoneConsent() -> Int32 {
+    switch AVAudioApplication.shared.recordPermission {
+    case .granted: return 1
+    case .undetermined:
+        _ = NSApplication.shared
+        var allowed: Bool?
+        AVAudioApplication.requestRecordPermission { granted in
+            DispatchQueue.main.async { allowed = granted }
+        }
+        while allowed == nil {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        }
+        if allowed == true {
+            fputs("launcher: microphone permission allowed\n", stderr)
+            return 1
+        }
+    default: break
+    }
+    fputs("launcher: microphone permission denied\n", stderr)
+    return 0
 }
 
 // 1: Play (the window's settings are in the environment), 0: the player quit, 2: no window (no launcher.json, or "Show this window at launch" off): launcher.c applies the saved choices
