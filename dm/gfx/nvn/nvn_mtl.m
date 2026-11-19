@@ -19932,6 +19932,7 @@ static void fg_keep(id<MTL4CommandBuffer> cb, int k, int pk, id<MTLTexture> gen)
     id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
     [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:resource_vis()];   // after MetalFX's encoders
     [ce setArgumentTable:g_fgmv_args];
+    // NOLINTNEXTLINE(clang-analyzer-nullability.NullablePassedToNonnull): a nil texture is one the kernel does not read, which fgmv_bind skips
     fgmv_bind(ce, FGMV_CUT, g_fg_tiles, g_fg_flags, nil, nil); [g_fgmv_args setAddress:g_fg_sw.gpuAddress atIndex:0];   // first: fgmv_still reads its part
     [ce dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)]; fgmv_step(ce);
     fgmv_bind(ce, FGMV_STILL, col, prev, g_fg_still, nil); fgmv_grid(ce, g_fg_still.width, g_fg_still.height); fgmv_step(ce);

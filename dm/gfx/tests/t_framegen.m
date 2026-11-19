@@ -36,7 +36,7 @@ static tex_t frame(int i) {   // present i: the moving square at square_x(i), th
 static void bright_d(id<MTLTexture> t, int d, int *lo, int *hi, int *still);
 static void bright(id<MTLTexture> t, int *lo, int *hi, int *still) { bright_d(t, 1, lo, hi, still); }
 static void bright_d(id<MTLTexture> t, int d, int *lo, int *hi, int *still) {
-    id<MTLBuffer> out = [g_dev newBufferWithLength:W * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [g_dev newBufferWithLength:W * 4 options:MTLResourceStorageModeShared]; if (!out) return;
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, (Y0 + SQ / 2) / d, 0) sourceSize:MTLSizeMake(W / d, 1, 1) toBuffer:out destinationOffset:0 destinationBytesPerRow:W * 4 destinationBytesPerImage:W * 4];
     [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
@@ -143,14 +143,14 @@ static float g_half(uint16_t h) {   // a half as a float (fgmv_cut's flags)
     return h >> 15 ? -v : v;
 }
 static void g_flags(float v[4]) {
-    id<MTLBuffer> out = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared]; if (!out) return;
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     [b copyFromTexture:g_fg_flags sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(1, 1, 1) toBuffer:out destinationOffset:0 destinationBytesPerRow:8 destinationBytesPerImage:8];
     [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
     const uint16_t *h = out.contents; for (int i = 0; i < 4; i++) v[i] = g_half(h[i]);
 }
 static uint8_t *g_grab(id<MTLTexture> t) {
-    id<MTLBuffer> out = [g_dev newBufferWithLength:t.width * t.height * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [g_dev newBufferWithLength:t.width * t.height * 4 options:MTLResourceStorageModeShared]; if (!out) return NULL;
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(t.width, t.height, 1) toBuffer:out destinationOffset:0
         destinationBytesPerRow:t.width * 4 destinationBytesPerImage:t.width * t.height * 4];
@@ -176,6 +176,7 @@ static void g_miss(const char *what, id<MTLTexture> gen, uint8_t *cur, uint8_t *
     id<MTLBuffer> os = [g_dev newBufferWithLength:nb * 2 options:MTLResourceStorageModeShared];
     id<MTLBuffer> ok = [g_dev newBufferWithLength:nb * 2 options:MTLResourceStorageModeShared];
     id<MTLBuffer> om = [g_dev newBufferWithLength:mw * mh * 8 options:MTLResourceStorageModeShared];
+    if (!os || !ok || !om) return;
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     for (int i = 0; i < 2; i++) {
         id<MTLTexture> t = i ? g_fg_keep : g_fg_still; id<MTLBuffer> o = i ? ok : os;
@@ -207,7 +208,7 @@ static int g_pair(int a, int b, int oa, int ob, int *i) { for (int k = 0; k < 4;
 // offset still leaves a change, with theirs (this is the pair of numbers the cut's thresholds sit between)
 static void g_tiles(const char *what) {
     long nt = g_fg_tiles.width * g_fg_tiles.height, n = 0, ch = 0; double cs = 0, bs = 0, mx = 0;
-    id<MTLBuffer> out = [g_dev newBufferWithLength:nt * 8 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [g_dev newBufferWithLength:nt * 8 options:MTLResourceStorageModeShared]; if (!out) return;
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     [b copyFromTexture:g_fg_tiles sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(g_fg_tiles.width, g_fg_tiles.height, 1) toBuffer:out destinationOffset:0
         destinationBytesPerRow:g_fg_tiles.width * 8 destinationBytesPerImage:nt * 8];
@@ -225,7 +226,7 @@ static void g_tiles(const char *what) {
 // The still blocks fgmv_hud decides on (a measurement): how many changed (0), are still (1), still with detail (2), changed with detail (3)
 static void g_st(const char *what) {
     long n = g_fg_still.width * g_fg_still.height, c[4] = {0, 0, 0, 0};
-    id<MTLBuffer> out = [g_dev newBufferWithLength:n * 2 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [g_dev newBufferWithLength:n * 2 options:MTLResourceStorageModeShared]; if (!out) return;
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     [b copyFromTexture:g_fg_still sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(g_fg_still.width, g_fg_still.height, 1) toBuffer:out destinationOffset:0
         destinationBytesPerRow:g_fg_still.width * 2 destinationBytesPerImage:n * 2];
@@ -252,7 +253,7 @@ static void g_dbg(const char *what, int kind) {
 // The blocks fgmv_hud decided on (a measurement): how many take the present's own pixels, half the step, the interpolator's
 static void g_keep_dump(const char *what) {
     long n = g_fg_keep.width * g_fg_keep.height, c[3] = {0, 0, 0};
-    id<MTLBuffer> out = [g_dev newBufferWithLength:n * 2 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [g_dev newBufferWithLength:n * 2 options:MTLResourceStorageModeShared]; if (!out) return;
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     [b copyFromTexture:g_fg_keep sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(g_fg_keep.width, g_fg_keep.height, 1) toBuffer:out destinationOffset:0
         destinationBytesPerRow:g_fg_keep.width * 2 destinationBytesPerImage:n * 2];
@@ -332,7 +333,7 @@ static tex_t sb_tex(float ox, int i) {
     t.d.target = NVN_TEXTURE_TARGET_2D; t.d.format = NVN_FORMAT_RGBA8; serial_put(t.serial, mt); res_add(mt); res_commit(); return t;
 }
 static uint8_t *sb_read(id<MTLTexture> t) {
-    id<MTLBuffer> out = [g_dev newBufferWithLength:SW * SH * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [g_dev newBufferWithLength:SW * SH * 4 options:MTLResourceStorageModeShared]; if (!out) return NULL;
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(SW, SH, 1) toBuffer:out destinationOffset:0 destinationBytesPerRow:SW * 4 destinationBytesPerImage:SW * SH * 4];
     [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
@@ -379,7 +380,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     if (argc > 1 && !strcmp(argv[1], "guards")) return guards_case();
     // "fusion": the run below with the cut guard off, as the frames were generated before it (every case of it must come out the same)
     if (argc > 1 && !strcmp(argv[1], "fusion")) setenv("DM_FRAMEGEN_CUT", "0", 1);
-    alarm(90); setbuf(stdout, NULL);
+    alarm(90); setvbuf(stdout, NULL, _IONBF, 0);
     setenv("DM_FRAMEGEN", "1", 1); setenv("DM_PRESENT_SNAP", "1", 1); setenv("DM_PRESENT_HZ", "0", 1); setenv("DM_PRESENT_LINK", "0", 1);   // the present thread first; the link's ticks are called below
     mtl_init();
     g_test_layer = [CAMetalLayer layer]; g_test_layer.device = g_dev; g_test_layer.drawableSize = CGSizeMake(W, H); g_test_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -532,7 +533,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     const int right[4] = {W / 2, 0, W / 2, H};
     for (int i = 26; i < 28; i++) { tex_t t = frame(i); present_enqueue(&t, 1 / 30.0, right, 0, NULL); copied(); tick(); tick(); }
     { int k6 = last_slot(); id<MTLTexture> c = g_snap[k6].tex;
-      id<MTLBuffer> out = [g_dev newBufferWithLength:c.width * 4 options:MTLResourceStorageModeShared];
+      id<MTLBuffer> out = [g_dev newBufferWithLength:c.width * 4 options:MTLResourceStorageModeShared]; if (!out) return 1;
       id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
       [b copyFromTexture:c sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, (Y0 + SQ / 2) * c.height / H, 0) sourceSize:MTLSizeMake(c.width, 1, 1) toBuffer:out destinationOffset:0 destinationBytesPerRow:c.width * 4 destinationBytesPerImage:c.width * 4];
       [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
@@ -544,7 +545,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     g_test_layer.drawableSize = CGSizeMake(W, H);
     for (int i = 28; i < 32; i++) { tex_t t = frame(i); present_enqueue(&t, 1 / 30.0, right, 0, NULL); copied(); tick(); tick(); }
     { int k7 = last_slot(); id<MTLTexture> c = g_snap[k7].tex;
-      id<MTLBuffer> out = [g_dev newBufferWithLength:c.width * 4 options:MTLResourceStorageModeShared];
+      id<MTLBuffer> out = [g_dev newBufferWithLength:c.width * 4 options:MTLResourceStorageModeShared]; if (!out) return 1;
       id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
       [b copyFromTexture:c sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, Y0 + SQ / 2, 0) sourceSize:MTLSizeMake(c.width, 1, 1) toBuffer:out destinationOffset:0 destinationBytesPerRow:c.width * 4 destinationBytesPerImage:c.width * 4];
       [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
