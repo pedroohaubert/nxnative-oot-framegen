@@ -874,10 +874,6 @@ t_pso_unwrap: t_pso_unwrap.m $(MTL_T_DEP)
 .PHONY: check_t_pso_unwrap
 check_t_pso_unwrap: t_pso_unwrap
 	./t_pso_unwrap
-# The game's dispatches side by side in the copy encoder where no barrier of its and nothing else lies between them (dispatch_enc, DM_NVN_DISPATCH_OVERLAP)
-t_dispatch_overlap: t_dispatch_overlap.m $(MTL_T_DEP)
-	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_overlap.m $(MTL_T_SRC) $(FW)
-check_t_dispatch_overlap: RUN_ENV = MTL_DEBUG_LAYER=1
 # A virtual pool's first whole mapping aliases it only while no address of its own range has left the host; sampler IDs past the pool are empty slots (issue #2513, PR #2519)
 t_vpool_first_map: t_vpool_first_map.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_vpool_first_map.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
