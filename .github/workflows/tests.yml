@@ -172,7 +172,10 @@ jobs:
   tool-tests:
     name: Tool tests
     runs-on: xcode-27
-    timeout-minutes: 15
+    # 25, not 15: the suite needs about 14 minutes of tests on the runner (upstream's own run is 13m38s, 1m22s from the old limit) and the fork carries the
+    # key-with-sword tests besides, so 15 minutes cut it off at the end of the test files rather than on a failure (the tool-tests runs of this fork's main,
+    # and of the pull request that measured it, both ended cancelled at the limit with every test up to that point OK)
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

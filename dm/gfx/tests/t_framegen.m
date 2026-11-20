@@ -59,7 +59,7 @@ static uint64_t tick(void) {   // one 60 Hz tick of the display link; returns th
     TUpdate *u = [TUpdate new]; u.drawable = [g_test_layer nextDrawable]; u.targetPresentationTimestamp = g_t; g_t += 1 / 60.0;
     uint64_t n = g_present_n; g_present_ser = 0;
     uint64_t t0 = now_ns();
-    [[NvMetalDisplayLinkDelegate new] metalDisplayLink:(CAMetalDisplayLink *)nil needsUpdate:(CAMetalDisplayLinkUpdate *)u];
+    [[NvMetalDisplayLinkDelegate new] metalDisplayLink:(CAMetalDisplayLink *)nil needsUpdate:(CAMetalDisplayLinkUpdate *)u];   // NOLINT(clang-analyzer-nullability.NullPassedToNonnull): the delegate never reads its link, and a nil one is what the test poses
     g_tick_ms = (now_ns() - t0) / 1e6;
     return g_present_n != n ? g_present_ser : 0;
 }
