@@ -244,13 +244,53 @@ kernel void fgmv_pstill(texture2d<float, access::read> cur [[texture(0)]], textu
     float3 d = max(fabs(a - b), fabs(b - c));
     m.write(half4(max(d.x, max(d.y, d.z)) <= 2.5f / 255 ? 1.0h : 0.0h), g);
 }
+// The UI mask (nvn_mtl.m fg_ui_pass_begin / fg_ui_take): a game whose UI is the frame's own last pass draws it into the picture the present shows, opened with
+// load and no depth, so the picture before that pass (copied into a host texture as it opened) and the picture presented (copied with the snapshot) differ by the
+// UI alone. Those two tell the HUD from the still blocks fgmv_still/fgmv_hud guess at, and they are right exactly when the HUD changes between two presents,
+// which is when a guess fails: a dialogue line or a heart is the present's own pixels in fgmv_keep, at the rate the game draws them, over a world still
+// interpolated. One block per 4x4 of the generated frame; the fraction along a HUD's edge blends (fgmv_keep's two keys) instead of freezing a 4 px halo.
+// A frame with no such pass runs it with one texel for both pictures and writes 0 everywhere: a mask from another frame cannot survive.
+#define FGMV_UI_DIFF (2.0f / 255)   // a channel's change under which a texel did not change (fgmv_still's own is 2.5/255 of luma)
+kernel void fgmv_uimask(texture2d<float, access::read> shown [[texture(0)]], texture2d<float, access::read> hudless [[texture(1)]],
+                        texture2d<half, access::write> mask [[texture(2)]], uint2 g [[thread_position_in_grid]]) {
+    if (g.x >= mask.get_width() || g.y >= mask.get_height()) return;
+    // The two pictures are the same one at two sizes: the one the screen shows (the present's copy, in the generated frame's own size) and the game's own,
+    // where its UI pass drew (its internal resolution, which the dynamic resolution steps). A block is 4x4 of the generated frame; its texels are compared
+    // with the same place in the game's picture, mapped by each one's own size — no shared factor, so neither 1920x1080 nor 1280x720 against 1440x810 is
+    // sampled in the wrong place
+    uint2 m = uint2(mask.get_width(), mask.get_height()), s = uint2(shown.get_width(), shown.get_height()), h = uint2(hudless.get_width(), hudless.get_height());
+    uint2 b0 = (g * s) / m, b1 = ((g + 1) * s + m - 1) / m;   // the block's first texel and one past its last
+    int w = max(1, (int)(b1.x - b0.x)), hh = max(1, (int)(b1.y - b0.y)), n = 0;
+    for (int y = 0; y < hh; y++) for (int x = 0; x < w; x++) {
+        uint2 ps = min(b0 + uint2(x, y), s - 1);
+        uint2 ph = min((ps * h) / s, h - 1);
+        float3 e = fabs(shown.read(ps).rgb - hudless.read(ph).rgb);
+        if (max(e.x, max(e.y, e.z)) > FGMV_UI_DIFF) n++;
+    }
+    mask.write(half4(half(float(n) / float(w * hh))), g);
+}
+// The part of the picture the mask covers (fg_ui_take, read back with the snapshot's commit): past FG_UI_BLANK the frame is shown as drawn, as in the game's
+// menus (a menu, a fade, a game that composes its UI as one full-screen quad), and the interpolation is not paid for. Not on the CPU before the frame: nothing
+// of a frame's own GPU work is waited for, so the answer starts the next frame.
+kernel void fgmv_uisum(texture2d<half, access::read> mask [[texture(0)]], device float *out [[buffer(0)]], uint li [[thread_index_in_threadgroup]]) {
+    threadgroup float s[FGMV_TG];
+    uint2 n = uint2(mask.get_width(), mask.get_height());
+    float v = 0;
+    for (uint i = li; i < n.x * n.y; i += FGMV_TG) v += float(mask.read(uint2(i % n.x, i / n.x)).r);
+    s[li] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = FGMV_TG / 2; st > 0; st >>= 1) { if (li < st) s[li] += s[li + st]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    if (!li) out[0] = s[0] / max(1.0f, (float)(n.x * n.y));
+}
 // keep 1 (a HUD, still pixels) and the three-present still mask: the present's own pixel. keep 0.5 (motion not trusted, fgmv_conf): the present's picture moved half the block's
 // step back towards the previous one, where it is at the generated frame's moment: the motion v takes a pixel of the present to the previous picture (fgmv_pick), so the frame between
 // shows at p what the present has at p - v/2. Shown unmoved, those blocks were half a step behind the picture around them, at 30 fps: blocks of texture that lagged on a camera turn (X13)
 kernel void fgmv_keep(texture2d<float, access::sample> cur [[texture(0)]], texture2d<half, access::read> keep [[texture(1)]], texture2d<float, access::write> out [[texture(2)]],
-                      texture2d<half, access::read> pm [[texture(3)]], texture2d<half, access::read> mot [[texture(4)]], uint2 g [[thread_position_in_grid]]) {
+                      texture2d<half, access::read> pm [[texture(3)]], texture2d<half, access::read> mot [[texture(4)]], texture2d<half, access::read> ui [[texture(5)]],
+                      uint2 g [[thread_position_in_grid]]) {
     if (g.x >= out.get_width() || g.y >= out.get_height()) return;
-    half k = keep.read(min(g / 4, uint2(keep.get_width() - 1, keep.get_height() - 1))).r;
+    half k = max(keep.read(min(g / 4, uint2(keep.get_width() - 1, keep.get_height() - 1))).r,   // the game's own UI pass where it has one (fgmv_uimask, 0 = none)
+                 ui.read(min(g / 4, uint2(ui.get_width() - 1, ui.get_height() - 1))).r);
     if (k > 0.75h || pm.read(g).r > 0.5h) { out.write(cur.read(g), g); return; }
     if (k < 0.25h) return;
     constexpr sampler ls(filter::linear, address::clamp_to_edge, coord::normalized);
