@@ -58,7 +58,7 @@ int main(void) {
     f_head += 100;
     CHECK("each stream reads with its own cursor", h_is_Filled(a) == 100 && h_is_Filled(b) == 100 && h_is_Read(a, buf, 50) == 50 && h_is_Filled(a) == 50 && h_is_Filled(b) == 100);
     CHECK("a stereo read gives each frame to both channels", h_is_Read(b, buf, 10) == 10 && buf[0] == buf[1] && buf[2] == buf[3] && buf[2] == buf[0] + 1);
-    h_is_SetGain(a, 0.5f, 0); int16_t one;
+    h_is_SetGain(a, 0.5f, 0); int16_t one = 0;
     CHECK("the gain scales the frames", h_is_GetGain(a) == 0.5f && h_is_Read(a, &one, 1) == 1 && one == (int16_t)(((f_head - 50) & 0x3fff) / 2));
     h_is_Stop(a);
     CHECK("a stopped stream reads nothing and releases the capture", h_is_State(a) == 1 && h_is_Read(a, buf, 4) == 0 && f_users == 1);
