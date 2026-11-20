@@ -1,11 +1,14 @@
 // Frame generation's motion (nvn_mtl.m fg_motion): the motion between two presented pictures, estimated here because the game gives none, as the MetalFX frame interpolator's
 // motion texture. MetalFX's own flow finds motion up to about 64 px a frame at 1176x540 (and tears or gives up past 96-192 px: the picture stays on one of the two frames, a
-// judder on fast camera turns); with motion vectors it places any pan exactly. Three passes at 1/8 of the picture's size:
+// judder on fast camera turns); with motion vectors it places any pan exactly. Three passes at 1/8 of the picture's size, and one over their tiles:
 //   fgmv_luma    each 8x8 block's mean luma (one per present, kept with its ring slot for the next present's search)
 //   fgmv_search  each tile of 8x8 of those (64x64 px of the picture) searched against the previous present's luma within +-FGMV_R (+-192 px), with a sub-pixel fit
 //   fgmv_pick    each 1/8 pixel takes, of its tile's vector, its 8 neighbours' and no motion, the one that matches best around it, so a still HUD or a character the camera
 //                follows keeps no motion beside the panning background
-// The motion texture is at 1/8 size, its vectors in its own pixels pointing to where a pixel was in the previous picture (MetalFX's convention, scale 1)
+//   fgmv_cut     whether the two pictures are a cut: the tiles' own confidence, low everywhere (nothing in either picture is where the search found it)
+// The motion texture is at 1/8 size, its vectors in its own pixels pointing to where a pixel was in the previous picture (MetalFX's convention, scale 1). What follows
+// works at the picture's own size: the still blocks (fgmv_still), how badly the motion explains each 1/8 pixel (fgmv_conf), and which blocks of the generated frame are
+// the present's own pixels (fgmv_hud, fgmv_keep).
 #include <metal_stdlib>
 using namespace metal;
 
@@ -29,7 +32,8 @@ kernel void fgmv_luma(texture2d<float, access::read> src [[texture(0)]], texture
     dst.write(half4(half(s / 16)), g);
 }
 
-// tiles: xy the vector (1/8 pixels, pointing to the previous picture), z how far its match beats the tile's mean (0 = a flat tile, nothing to go by)
+// tiles: xy the vector (1/8 pixels, pointing to the previous picture), z how far its match beats the tile's mean (0 = a flat tile, nothing to go by), w that mean
+// difference (0 = nothing in the tile to match: a flat sky, a black screen)
 kernel void fgmv_search(texture2d<half, access::read> cur [[texture(0)]], texture2d<half, access::read> prev [[texture(1)]], texture2d<half, access::write> tiles [[texture(2)]],
                         uint2 tg [[threadgroup_position_in_grid]], uint li [[thread_index_in_threadgroup]]) {
     threadgroup half c[FGMV_T * FGMV_T];
@@ -78,7 +82,7 @@ kernel void fgmv_search(texture2d<half, access::read> cur [[texture(0)]], textur
         if (qy > 1e-5f) v.y += clamp(0.5f * (sy[0] - sy[1]) / qy, -0.5f, 0.5f);
     }
     float mean = sm[0] / FGMV_N, conf = mean > 1e-3f ? clamp((mean - bs[0]) / mean, 0.0f, 1.0f) : 0.0f;
-    tiles.write(half4(half(v.x), half(v.y), half(conf), 0), tg);
+    tiles.write(half4(half(v.x), half(v.y), half(conf), half(mean)), tg);
 }
 
 // The 3x3 window's mean absolute difference between cur at g and prev at g + v (bilinear, in 1/8 pixels)
@@ -117,12 +121,48 @@ kernel void fgmv_pick(texture2d<half, access::read> cur [[texture(0)]], texture2
     mot.write(half4(half(bv.x), half(bv.y), 0, 0), g);
 }
 
+// fgmv_cut (nvn_mtl.m fg_keep): whether this pair of presents is a cut, so that neither real picture gives way to a picture invented between them. The tiles alone say
+// it: at a cut nothing in either picture is where the search found it, so every tile with something
+// to match changes at its best offset and no offset explains it (fgmv_search's confidence, low everywhere). A pan, however fast within the search's reach, explains its
+// tiles, and a still picture leaves no difference at all. A fast pan past the reach explains none of them either and reads as a cut here: past 192 px a frame the
+// interpolator has nothing to place the picture with (t_framegen cut).
+//   flags   x 1 when the pair is a cut, y the part of the picture's tiles that changed, z their mean confidence, w 0
+#define FGMV_CUT_DETAIL 0.01f   // a tile whose mean difference over the search is under this has nothing to match (a flat sky, a black screen): its confidence says nothing
+#define FGMV_CUT_PIX 0.015f     // the difference a tile keeps at its best offset past which it counts as changed (about 4/255 of luma)
+#define FGMV_CUT_TILES 0.25f    // the part of all the tiles that must have something to match, or the picture is too flat for the confidence to mean anything
+#define FGMV_CUT_PART 0.6f      // the part of the detailed tiles that must have changed
+#define FGMV_CUT_CONF 0.75f     // their mean confidence under which no motion explains the change (a pan's search explains over 0.9 of it)
+kernel void fgmv_cut(texture2d<half, access::read> tiles [[texture(0)]], texture2d<half, access::write> flags [[texture(1)]],
+                     constant uint &sw [[buffer(0)]], uint li [[thread_index_in_threadgroup]]) {
+    threadgroup float det[FGMV_TG], chg[FGMV_TG], cf[FGMV_TG];
+    uint2 n = uint2(tiles.get_width(), tiles.get_height());
+    float d = 0, c = 0, s = 0;
+    for (uint i = li; i < n.x * n.y; i += FGMV_TG) {
+        half4 t = tiles.read(uint2(i % n.x, i / n.x));
+        float mean = float(t.w), best = mean * (1 - float(t.z));
+        if (mean < FGMV_CUT_DETAIL) continue;
+        d++;
+        if (best < FGMV_CUT_PIX) continue;
+        c++; s += float(t.z);
+    }
+    det[li] = d; chg[li] = c; cf[li] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = FGMV_TG / 2; st > 0; st >>= 1) {
+        if (li < st) { det[li] += det[li + st]; chg[li] += chg[li + st]; cf[li] += cf[li + st]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (li) return;
+    float part = chg[0] / max(1.0f, (float)(n.x * n.y)), conf = chg[0] > 0 ? cf[0] / chg[0] : 1;
+    float cut = det[0] >= FGMV_CUT_TILES * (float)(n.x * n.y) && det[0] > 0 && chg[0] / det[0] >= FGMV_CUT_PART && conf <= FGMV_CUT_CONF;
+    flags.write(half4(half(cut && (sw & 1) ? 1 : 0), half(part), half(conf), 0), uint2(0));
+}
+
 // The HUD (nvn_mtl.m fg_keep): with motion anywhere in the picture MetalFX moves still pixels beside it too, so a still HUD over a panning background smears even when its
 // own vectors say it stays (probe: 0.03-0.09 of mean error on the HUD, against 0.0015 with no motion at all). Pixels that did not change since the previous present and have
 // detail around them (a HUD, the character the camera follows when it stands still), and still pixels near those (a HUD's flat fill), are taken from the present as it is.
 // A flat still area alone is left to the interpolator: something thin that crossed it between the two presents is in the generated frame there.
 //   fgmv_still  per 4x4 block of the picture: 1 still, 2 still with detail (a 6x6 window: no channel changed by more than 2/255; luma spread over 0.08)
-//   fgmv_hud    per block: still, with a still detailed block within 3 blocks (12 px)
+//   fgmv_hud    per block: still, with a still detailed block within 3 blocks (12 px); a cut's present whole (fgmv_cut)
 //   fgmv_keep   per pixel of the generated frame: the present's own where its block is kept
 kernel void fgmv_still(texture2d<float, access::read> cur [[texture(0)]], texture2d<float, access::read> prev [[texture(1)]], texture2d<half, access::write> st [[texture(2)]],
                        uint2 g [[thread_position_in_grid]]) {
@@ -172,16 +212,19 @@ kernel void fgmv_conf(texture2d<half, access::read> cur [[texture(0)]], texture2
 // and the scene error was 0.0058-0.0237; not pasted, 0.1-0.7 % held and 0.0023-0.0187 (the picture's own error halved on a slow pan), the moving object's error
 // 0.063-0.113 against 0.093-0.131, at the cost of more smear right around that object (0.045-0.077 against 0.028-0.059 of what none of the three pictures has)
 constant bool FGMV_PASTE [[function_constant(0)]];
+// flags: fgmv_cut's (x a cut)
 kernel void fgmv_hud(texture2d<half, access::read> st [[texture(0)]], texture2d<half, access::write> keep [[texture(1)]], texture2d<half, access::read> conf [[texture(2)]],
-                     uint2 g [[thread_position_in_grid]]) {
+                     texture2d<half, access::read> flags [[texture(3)]], constant uint &sw [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {
     if (g.x >= keep.get_width() || g.y >= keep.get_height()) return;
     int2 mx = int2(st.get_width() - 1, st.get_height() - 1), gi = int2(g);
-    half k = 0;
+    // A cut (fgmv_cut, DM_FRAMEGEN_CUT): the present's own picture over the whole frame. There is no picture between two scenes, so the interpolator's blend of them
+    // is what the screen shows instead of each: the display link shows this present's own picture on the tick before its own, and both real frames are seen as drawn
+    half k = (sw & 1) && flags.read(uint2(0)).x > 0.5h ? 1.0h : 0.0h;
     // A block within one 1/8 pixel of motion of its own not trusted (fgmv_conf positive: a model moving its own way on a camera turn, what it uncovers): the present's own (1), over
     // the 24x24 around it as in X13, so a model is taken whole from one moment. Cut to the 1/8 pixel alone, parts of a model came from the present and the cells beside them from the
     // interpolation, and models twitched on camera turns (X14's first builds, the owner). Motion its neighbours share (negative: detail of the ground the camera turns over), in this
     // 1/8 pixel alone: the present's own moved half its step (0.5, fgmv_keep), where X13's unmoved squares were the patches of texture on a camera turn
-    if (conf.get_width() > 1) {
+    if (k < 1.0h && conf.get_width() > 1) {
         int2 cm = int2(conf.get_width() - 1, conf.get_height() - 1), c = gi / 2;
         if (FGMV_PASTE) for (int y = -1; y <= 1 && k < 1.0h; y++) for (int x = -1; x <= 1; x++) if (float(conf.read(uint2(clamp(c + int2(x, y), int2(0), cm))).r) > FGMV_BAD) { k = 1; break; }
         if (k < 1.0h && float(conf.read(uint2(clamp(c, int2(0), cm))).r) < -FGMV_BAD) k = 0.5h;
