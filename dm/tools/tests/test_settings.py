@@ -12,7 +12,8 @@ class ResolutionSetting(unittest.TestCase):
             for header,supported in [('# BUILD_ID\t3c10ec35c5ef4c3686b4053afb0e58e7\n',False),
                                      ('# DYNAMIC_RESOLUTION\t1\n',True),('',False)]:
                 p.write_text(header)
-                rows=settings.build('010056B015FE8000',tmp,'unused')['settings']
+                with patch.dict(settings.os.environ,{'SETTINGS_PLATFORM':'mac'}):
+                    rows=settings.build('010056B015FE8000',tmp,'unused')['settings']
                 dr=[s for s in rows if s['env']=='DM_DYNAMIC_RESOLUTION']
                 self.assertEqual(bool(dr),supported)
                 if dr:self.assertEqual((dr[0]['kind'],dr[0]['default']),('toggle','0'))
@@ -27,8 +28,19 @@ class FrameRateOption(unittest.TestCase):
             for gid,platform,has in [('04007EF01F8AE000','mac',True),('04007EF01F8AE000','ios',True),('010056B015FE8000','mac',False),('010056B015FE8000','ios',False)]:   # Fortune's Weave (fps_max 120), NieR:Automata (none)
                 with patch.dict(settings.os.environ,{'SETTINGS_PLATFORM':platform}):
                     fps=next(s for s in settings.build(gid,tmp,'unused')['settings'] if s['env']=='DM_FPS_TARGET')
-                self.assertEqual(fps['default'],'60',gid)
+                self.assertEqual(fps['default'],'30' if platform=='ios' else '60',(gid,platform))
                 self.assertEqual(fps['options'],[['30','30 fps'],['60','60 fps']]+([['120','120 fps']] if has else []),(gid,platform))
+
+    def test_40_only_where_the_frame_step_takes_ticks_of_1_120_s(self):
+        """40 fps needs a frame step stub in ticks of 1/120 s (FRAME_STEP_120 in main's fixups table: Ocarina of Time's ratio stub); both platforms offer it, the host and iOS launcher check the screen"""
+        with tempfile.TemporaryDirectory() as tmp,patch.object(settings.nacp,'languages',return_value=['en-US']):
+            p=Path(tmp)/'main.fixups.tsv'
+            for header,platform,has in [('# FRAME_STEP_120\t1\n','ios',True),('# FRAME_STEP_120\t1\n','mac',True),('','ios',False),('# DYNAMIC_RESOLUTION\t1\n','mac',False)]:
+                p.write_text(header)
+                with patch.dict(settings.os.environ,{'SETTINGS_PLATFORM':platform}):
+                    fps=next(s for s in settings.build('0400486024DEC000',tmp,'unused')['settings'] if s['env']=='DM_FPS_TARGET')
+                self.assertEqual(fps['default'],'30' if platform=='ios' else '60',(header,platform))
+                self.assertEqual(fps['options'],[['30','30 fps']]+([['40','40 fps']] if has else [])+[['60','60 fps']],(header,platform))
 
 class UpscalerSetting(unittest.TestCase):
     def test_only_for_games_naming_their_upscaler(self):
