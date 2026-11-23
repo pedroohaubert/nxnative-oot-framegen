@@ -15,6 +15,8 @@ void bf_want_note(const char *key);
 // Memory pool: [mem, mem+size) is expanded outward to page boundaries to build a zero-copy buffer; look up the buffer and offset by GPU address (= CPU address)
 void mtl_pool_add(const void *mem, uint64_t size);
 void mtl_pool_addressed(const void *mem, uint64_t size);   // the game holds a GPU address in this range, so raw global memory may reach it
+void mtl_preread(const void *mem, uint64_t size);   // DM_NVN_PREREAD=1: read this guest range ahead in the background (L7.7 test)
+void mtl_vis_report_recorded(uint64_t addr);   // a samples-passed report recorded: its record reads "visible" while it may be read stale (DM_NVN_VIS_PROVISIONAL, L7.9)
 void mtl_pool_del(const void *mem);
 void mtl_pool_replace(const void *const *del, int ndel, const void *const *add, const uint64_t *size, int nadd);   // in one step for every lookup (a sparse pool's runs, hle_nvn.c vrun_set)
 void mtl_sparse_alias_delta(int delta);   // active sparse virtual pools with mapped runs (resource_vis MTL4VisibilityOptionResourceAlias)

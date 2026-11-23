@@ -92,6 +92,11 @@ t_mtl_init: t_mtl_init.m $(MTL_T_DEP)
 check_t_mtl_init: t_mtl_init
 	./t_mtl_init
 	DM_TEST_NO_METAL4=1 ./t_mtl_init
+t_vislog_track: t_vislog_track.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_vislog_track.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
+.PHONY: check_t_vislog_track
+check_t_vislog_track: t_vislog_track
+	./t_vislog_track
 t_nvn: t_nvn.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -DDM_TEST_NVN_SDK -fobjc-arc -o $@ t_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
 t_nvn_accel: t_nvn_accel.m $(MTL_T_DEP)
@@ -112,6 +117,8 @@ t_dirty_slots: t_dirty_slots.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_
 	clang $(CFLAGS) -o $@ t_dirty_slots.c ../../host/crash.c ../nvn/nvn_dirty.c
 t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_race.c ../../host/crash.c
+t_dirty_hot: t_dirty_hot.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
+	clang $(CFLAGS) -o $@ t_dirty_hot.c ../../host/crash.c
 t_dirty_init: t_dirty_init.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_init.c ../../host/crash.c ../nvn/nvn_dirty.c
 t_dirty_init_tsan: t_dirty_init.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
@@ -938,6 +945,16 @@ check_t_render_enable_queue: t_render_enable_queue
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./$<
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./$<
 
+t_mem_pressure: t_mem_pressure.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_mem_pressure.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_mem_pressure
+check_t_mem_pressure: t_mem_pressure
+	./t_mem_pressure
+t_vis_provisional: t_vis_provisional.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_vis_provisional.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_vis_provisional
+check_t_vis_provisional: t_vis_provisional
+	./t_vis_provisional
 t_vis_need: t_vis_need.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_vis_need.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 .PHONY: check_t_vis_need

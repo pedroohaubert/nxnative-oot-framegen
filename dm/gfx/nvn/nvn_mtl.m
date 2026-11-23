@@ -492,14 +492,21 @@ static void res_q_put(id<MTLAllocation> r, int add) {   // Caller holds g_res_mu
     if (g_res_qn == g_res_qcap) { g_res_qcap = g_res_qcap ? 2 * g_res_qcap : 256; g_res_q = realloc_or_die(g_res_q, g_res_qcap * sizeof *g_res_q, "the residency changes"); }
     g_res_q[g_res_qn++] = (res_op){CFBridgingRetain(r), add};
 }
+// kid-with-sword-remake L8.1: DM_NVN_RES_PLACED_PARENT=1 makes a placed texture resident beside its heap (nxnative bbacc45c, PR #1696: fragment sampling through its views under
+// Shader Validation needs the parent texture in the set). Off by default in this fork: Ocarina of Time ran without it through L7, and with it the residency set tracks every
+// placed texture as well as its heap (the L8 log: 5-7 GB added to the set every 300 frames in an area change, against about 2 GB before), so the heap alone stands for them, as before
+static int placed_parent_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_NVN_RES_PLACED_PARENT"); v = e && *e && atoi(e) > 0; if (v) MLOG("DM_NVN_RES_PLACED_PARENT=1: a placed texture is resident beside its heap"); }
+    return v;
+}
 static void res_add_at(id<MTLAllocation> allocation, int line) { @autoreleasepool {
     if (!allocation) return;
-    // A placed texture's heap covers storage; fragment sampling through its
-    // views also needs the parent texture descriptor. Retire both through the
-    // existing ownership and queued-residency paths, not a second heap queue.
-    if ([(id)allocation conformsToProtocol:@protocol(MTLResource)] && ((id<MTLResource>)allocation).heap)
-        res_add_at(((id<MTLResource>)allocation).heap, line);
-    id<MTLAllocation> r = allocation;
+    // A placed texture's heap covers storage. With DM_NVN_RES_PLACED_PARENT=1 the texture itself goes in too (fragment sampling through its views needs the parent texture
+    // descriptor), both retired through the existing ownership and queued-residency paths; otherwise the heap stands for it (its owner removes the heap after the last texture or view)
+    int placed = [(id)allocation conformsToProtocol:@protocol(MTLResource)] && ((id<MTLResource>)allocation).heap;
+    if (placed && placed_parent_on()) res_add_at(((id<MTLResource>)allocation).heap, line);
+    id<MTLAllocation> r = placed && !placed_parent_on() ? (id)((id<MTLResource>)allocation).heap : allocation;
     int maybe_file = [(id)r conformsToProtocol:@protocol(MTLBuffer)]
                   && ((id<MTLBuffer>)r).storageMode == MTLStorageModeShared
                   && ((id<MTLBuffer>)r).length > 0;
@@ -525,6 +532,7 @@ static void res_add_at(id<MTLAllocation> allocation, int line) { @autoreleasepoo
 } }
 static void res_remove(id<MTLAllocation> r) { @autoreleasepool {
     if (!r) return;
+    if (!placed_parent_on() && [(id)r conformsToProtocol:@protocol(MTLResource)] && ((id<MTLResource>)r).heap) return;   // its heap stands for it (res_add_at)
     pthread_mutex_lock(&g_res_mu);
     if (![g_res_objects containsObject:r]) { pthread_mutex_unlock(&g_res_mu); return; }
     res_q_put(r, 0);
@@ -551,6 +559,38 @@ static void res_remove(id<MTLAllocation> r) { @autoreleasepool {
 // RH_CAP bytes waiting, leave the residency set when a submission begins (rh_trim). DM_NVN_RT_RECYCLE=0 makes each texture its own allocation and each family heap exact and freed
 // with its last texture, as before; ab alternates it with the DM_AB phases
 enum { RH_CAP = 256u << 20 }; static const uint64_t RH_IDLE_NS = 3000000000ull;
+// kid-with-sword-remake L8.1: memory pressure mode. An iPhone 18 Pro's L8 session stuttered once a new area's textures took the footprint to 5.3-5.5 GB: iOS then pushed the game's
+// memory (in files, DM_GUEST_FILE) out and the game read it back mid-frame (up to 101 MB in a 338 ms frame; 54 frames dropped in 300). While the footprint is at DM_NVN_MEM_HIGH_MB
+// (default 4600) or more, or the room iOS leaves the app (os_proc_available_memory) is under DM_NVN_MEM_ROOM_MB (default 3000), the host gives memory back sooner: shared render
+// targets drawn over go after 1 s unused instead of 3 (tu_pass), recycled heaps go at once (rh_trim) and pools are not made resident ahead (res_trickle). It ends 300 MB under
+// both (hysteresis). Read at most every 0.5 s (task_info, on the submit thread). DM_NVN_MEM_HIGH_MB=0 turns it off
+typedef struct { int64_t high_mb, room_mb; } mem_hot_cfg;
+static int mem_hot_next(int was, int64_t footprint_mb, int64_t room_mb, mem_hot_cfg c) {   // room_mb < 0: not known (the Mac)
+    if (c.high_mb <= 0) return 0;
+    if (was) return footprint_mb >= c.high_mb - 300 || (room_mb >= 0 && room_mb < c.room_mb + 300);
+    return footprint_mb >= c.high_mb || (room_mb >= 0 && room_mb < c.room_mb);
+}
+static _Atomic uint64_t g_cur_frame;   // the presented frame (declared again below)
+static _Atomic int g_mem_hot; static _Atomic uint64_t g_mem_hot_n;
+static int mem_hot(void) {
+    static uint64_t at; static mem_hot_cfg cfg = {-1, 0};
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (at && now - at < 500000000ull) return atomic_load_explicit(&g_mem_hot, memory_order_relaxed);
+    at = now;
+    if (cfg.high_mb < 0) { const char *h = getenv("DM_NVN_MEM_HIGH_MB"), *r = getenv("DM_NVN_MEM_ROOM_MB"); cfg.high_mb = h && *h ? atoll(h) : 4600; cfg.room_mb = r && *r ? atoll(r) : 3000; }
+    task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT; int64_t fp = 0, room = -1;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS) fp = (int64_t)(vi.phys_footprint >> 20);
+#if TARGET_OS_IPHONE
+    room = (int64_t)(os_proc_available_memory() >> 20);
+#endif
+    int was = atomic_load(&g_mem_hot), hot = mem_hot_next(was, fp, room, cfg);
+    if (hot != was) {
+        atomic_store(&g_mem_hot, hot); uint64_t n = atomic_fetch_add(&g_mem_hot_n, 1) + 1;
+        if (n <= 40 || n % 100 == 0) MLOG("memory %s (frame %llu): footprint %lld MB, room to the limit %lld MB; %s (#%llu)", hot ? "high" : "back to normal", (unsigned long long)atomic_load(&g_cur_frame),
+                                         (long long)fp, (long long)room, hot ? "unused render targets go after 1 s, recycled heaps at once, no pools made resident ahead" : "the usual pacing again", (unsigned long long)n);
+    }
+    return hot;
+}
 typedef struct { void *heap; uint64_t size, t; } rh_ent;   // heap: retained (CFBridgingRetain); t: when it began to wait
 static os_unfair_lock g_rh_lk = OS_UNFAIR_LOCK_INIT; static rh_ent *g_rh; static unsigned g_rh_n, g_rh_cap; static uint64_t g_rh_bytes;
 static _Atomic uint64_t g_rh_made, g_rh_reused, g_rh_trimmed;   // for the memory readout
@@ -654,19 +694,20 @@ static void tu_register(id<MTLTexture> t, uint64_t serial) {
     if (g_tu_gone.n && nvn_hm_del(&g_tu_gone, &serial)) g_tu_remade++;
     os_unfair_lock_unlock(&g_tu_lk);
 }
-// When a submission begins: heaps that waited RH_IDLE_NS, and the oldest past RH_CAP bytes, leave the residency set and are freed; all of them when memory is short (mem_trim). → bytes freed
+// When a submission begins: heaps that waited RH_IDLE_NS, and the oldest past RH_CAP bytes, leave the residency set and are freed; all of them when memory is short (mem_trim or mem_hot). → bytes freed
 static uint64_t rh_trim_n(int all, unsigned *n_out) {
     if (!g_rh_n) { if (n_out) *n_out = 0; return 0; }
+    int hot = all || mem_hot();
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), bytes = 0; unsigned n = 0;
     for (;;) {
         void *drop[64]; unsigned nd = 0;
         os_unfair_lock_lock(&g_rh_lk);
         while (g_rh_n && nd < 64) {
             unsigned old = 0; for (unsigned i = 1; i < g_rh_n; i++) if (g_rh[i].t < g_rh[old].t) old = i;
-            if (!all && now - g_rh[old].t < RH_IDLE_NS && g_rh_bytes <= RH_CAP) break;
+            if (!hot && now - g_rh[old].t < RH_IDLE_NS && g_rh_bytes <= RH_CAP) break;   // under memory pressure every waiting heap goes (mem_hot / mem_trim)
             drop[nd++] = g_rh[old].heap; bytes += g_rh[old].size; g_rh_bytes -= g_rh[old].size; g_rh[old] = g_rh[--g_rh_n];
         }
-        int more = all && g_rh_n;
+        int more = hot && g_rh_n;
         os_unfair_lock_unlock(&g_rh_lk);
         for (unsigned i = 0; i < nd; i++) { id<MTLHeap> h = CFBridgingRelease(drop[i]); res_remove(h); }
         n += nd;
@@ -1466,6 +1507,11 @@ typedef struct seg_clk seg_clk; static seg_clk *g_sclk; static void seg_clk_put(
 // GPU would at that point in the queue: Ocarina of Time reports its queries a submission ahead of the conditional draws, so every one has landed by then (1.48 million
 // conditions on its Kokiri Forest route, 42% false; the host drew them all, GPU p50 17.06 → 16.44 ms a frame on an M4 Pro). Inside a block evaluated false, draws and clears are dropped
 static int g_rc_skip;   // logical queue state: a render-enable block evaluated false is active
+// DM_NVN_RC_DRAW=1 (test, kid-with-sword-remake L7.9): a condition on report records never drops draws or clears (as before conditions were evaluated); SetRenderEnable(false)
+// still does. With DM_NVN_VISLOG the condition a draw of the logged size would have been dropped by is logged either way (g_rc_last: the last condition evaluated)
+static int rc_draw_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_RC_DRAW"); on = e && atoi(e) > 0; if (on) MLOG("DM_NVN_RC_DRAW=1: conditions on report records never drop draws (test)"); } return on; }
+static struct { int mode, known, would; uint64_t addr, x, y, mx[2], my[2]; int fx, fy; } g_rc_last = {.mode = -1};
+static _Atomic uint64_t g_vislog_skips, g_vislog_cond, g_vislog_cond_unknown, g_vislog_seen, g_vislog_first, g_vislog_last;
 // Latest command-ordered writer of each report counter. Completed reports are read
 // from memory, so CPU rewrites remain visible. Unfinished queries stay unknown;
 // timestamp counters and explicit writes can supply known bytes before completion.
@@ -1663,6 +1709,85 @@ static void rc_gpu_write(uint64_t dst, uint64_t n) {
 // Counting starts at the first reset or, for a game that never resets, at the first report: the GPU's counter runs from the queue's creation, so such a game reads end - begin of two reports around each query
 // (Red Dead Redemption's character occlusion queries: counting used to start only at a reset, so every report was 0 and the bodies of characters a few metres away were dropped).
 // (Previously always wrote 0: occlusion query = 'fully occluded', campfires / light sources got culled - the character select screen calls ResetCounter 21 times per frame)
+// kid-with-sword-remake L7.9: a samples-passed record that could be read stale gets a count of 1 when the game records its report (nvnCommandBufferReportCounter, on the game's
+// thread: mtl_vis_report_recorded), so a game that reads it before the host has written the answer reads "visible", not "occluded" (DM_NVN_VIS_PROVISIONAL, on by default; 0 = off).
+// The host writes a report's count only when its submission completes, and its replay runs behind the game's recording: Ocarina of Time wraps a Goku mod's body (one 20,598-index
+// mesh) in a query, and on some starts read a 0 early, culled the body and never queried it again, so it stayed invisible all session while every other piece of Link drew. Setting the
+// count when the report was encoded on the submit thread came too late (131,072 corrections in a session, and the body still vanished): the game had read the record already.
+// Only a count of 0 that may be stale is replaced: one never written (count and timestamp 0), or one whose previous report on that record has not completed yet (g_vis_pend, by
+// address; a collision counts as pending). A 0 the last completed report wrote stays, so an object that really is hidden stays culled. The completion writes the real count over it
+// DM_NVN_VISLOG=<index count> (diagnostic, kid-with-sword-remake L7.9): the samples-passed reports whose counting window holds a draw of that many indices are logged with the
+// count the GPU gave them (each 0, and 1 in 30 of the others), and the window report every 600 frames says how often that mesh was drawn: a mod's piece the game stops drawing
+// (the Goku mod's body, 20,598 indices) shows whether its query read 0 before it went
+static int g_vislog = -1, g_vislog_mark; static _Atomic uint64_t g_vislog_draws, g_vislog_reports, g_vislog_zero;
+static void vislog_cond(int skipped, int indirect);
+static int vislog_on(void) { if (g_vislog < 0) { const char *e = getenv("DM_NVN_VISLOG"); g_vislog = e ? atoi(e) : 0; if (g_vislog) MLOG("DM_NVN_VISLOG=%d: queries around draws of %d indices are logged", g_vislog, g_vislog); } return g_vislog; }
+static uint64_t g_vis_prov; static _Atomic int32_t g_vis_pend[4096];
+static unsigned vis_ph(uint64_t a) { return (unsigned)(((a >> 4) * 0x9E3779B97F4A7C15ull) >> 52); }
+static int vis_prov_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_VIS_PROVISIONAL"); on = !(e && !strcmp(e, "0")); if (!on) MLOG("DM_NVN_VIS_PROVISIONAL=0: a samples-passed record holds what it held until its submission completes"); } return on; }
+// DM_NVN_VIS_ALL=1 (test, kid-with-sword-remake L7.9): every samples-passed report reads visible. The count written is the real one plus a bias that grows by 2^20 a report, so a
+// game reading one count, or end - begin of two, sees a large one, and a conditional render comparing two records draws; a record still 0 when the game records its report reads 1.
+// It makes the game draw what its occlusion queries would cull (more GPU work), so it shows whether a piece the game stopped drawing (the Goku mod's body) was dropped by a query
+static int vis_all_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_VIS_ALL"); on = e && atoi(e) > 0; if (on) MLOG("DM_NVN_VIS_ALL=1: every samples-passed report reads visible (test)"); } return on; }
+static uint64_t g_vis_bias;
+void mtl_vis_report_recorded(uint64_t ad) {
+    if (!ad || (ad & 7) || !(vis_prov_on() || vis_all_on())) return;
+    int32_t pend = atomic_fetch_add_explicit(&g_vis_pend[vis_ph(ad)], 1, memory_order_acq_rel);
+    uint64_t rec[2]; vm_size_t got = 0;
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)ad, sizeof rec, (vm_address_t)rec, &got) || got != sizeof rec) return;   // not readable: leave it to the completion
+    if (rec[0] || (rec[1] && pend <= 0 && !vis_all_on())) return;   // a count, or a 0 its last completed report wrote
+    uint64_t one = 1; memcpy((void *)ad, &one, sizeof one);
+    if (g_vis_prov++ < 4 || !(g_vis_prov & (g_vis_prov - 1))) MLOG("occlusion queries: record %#llx read 0 (%s), reads 1 (visible) until its report completes (%llu so far)", (unsigned long long)ad, rec[1] ? "its previous report still running" : "never written", (unsigned long long)g_vis_prov);
+}
+static void vis_report_done(uint64_t ad) {   // a report's answer written (post_run): one fewer pending on that record
+    if (!ad || (ad & 7)) return;
+    _Atomic int32_t *c = &g_vis_pend[vis_ph(ad)]; int32_t v = atomic_load_explicit(c, memory_order_relaxed);
+    while (v > 0 && !atomic_compare_exchange_weak_explicit(c, &v, v - 1, memory_order_acq_rel, memory_order_relaxed)) {}
+}
+// DM_NVN_VISLOG: a draw of the logged size under a condition on report records: whether the condition dropped it (or, with DM_NVN_RC_DRAW, would have), and what the two records held
+static _Atomic uint64_t g_cur_frame;
+static void vislog_cond(int skipped, int indirect) {
+    if (g_rc_last.mode < 0) return;
+    uint64_t n = atomic_fetch_add(&g_vislog_cond, 1) + 1; if (!g_rc_last.known) atomic_fetch_add(&g_vislog_cond_unknown, 1); if (!g_rc_last.would) return;
+    uint64_t k = atomic_fetch_add(&g_vislog_skips, 1) + 1;
+    if (k <= 12 || !(k & (k - 1)))
+        MLOG("[vislog] frame %llu: a %d-index draw%s %s by a condition (%s, records %#llx / +16: values %llu / %llu; memory %llu,%llu / %llu,%llu; flags %#x / %#x; %llu of %llu conditional draws of it)",
+             (unsigned long long)atomic_load(&g_cur_frame), g_vislog, indirect ? " (indirect)" : "", skipped ? "dropped" : "kept (DM_NVN_RC_DRAW)", g_rc_last.mode ? "draw if not equal" : "draw if equal",
+             (unsigned long long)g_rc_last.addr, (unsigned long long)g_rc_last.x, (unsigned long long)g_rc_last.y, (unsigned long long)g_rc_last.mx[0], (unsigned long long)g_rc_last.mx[1],
+             (unsigned long long)g_rc_last.my[0], (unsigned long long)g_rc_last.my[1], g_rc_last.fx, g_rc_last.fy, (unsigned long long)k, (unsigned long long)n);
+}
+// DM_NVN_VISLOG: every 150 frames and when graphics suspend, what happened to draws of the logged size, in all and since the last line: issued by the game (replay, before any
+// condition drops one), encoded, under a condition (unknown at replay: drawn), dropped, and the query reports around it
+// With DM_NVN_VISLOG every indexed draw the replay meets is counted by its index count (g_census, open addressing; a full table counts the rest as lost), and each summary at a
+// 600-frame mark or a suspend lists them, so the pieces drawn on a launch where a mod's piece is missing can be compared with one where it shows
+enum { CENSUS_N = 16384 }; static struct { uint32_t key, n; } g_census[CENSUS_N]; static uint64_t g_census_lost;
+static void census_add(uint32_t c) { if (!c) return; unsigned h = (c * 2654435761u) & (CENSUS_N - 1);
+    for (int k = 0; k < 64; k++, h = (h + 1) & (CENSUS_N - 1)) { if (g_census[h].key == c) { g_census[h].n++; return; } if (!g_census[h].key) { g_census[h].key = c; g_census[h].n = 1; return; } }
+    g_census_lost++; }
+static int census_cmp(const void *a, const void *b) { uint32_t x = ((const uint32_t *)a)[0], y = ((const uint32_t *)b)[0]; return x < y ? -1 : x > y; }
+static void census_dump(unsigned long long frame, const char *why) {
+    static uint32_t v[CENSUS_N][2]; int m = 0; for (int i = 0; i < CENSUS_N; i++) if (g_census[i].key) { v[m][0] = g_census[i].key; v[m][1] = g_census[i].n; m++; }
+    qsort(v, m, sizeof v[0], census_cmp); MLOG("[census] %s frame %llu: %d index counts drawn since the last list (%llu lost)", why, frame, m, (unsigned long long)g_census_lost);
+    char line[4096]; int o = 0;
+    for (int i = 0; i < m; i++) { o += snprintf(line + o, sizeof line - o, " %u:%u", v[i][0], v[i][1]); if (o > 3900 || i == m - 1) { MLOG("[census]%s", line); o = 0; } }
+    memset(g_census, 0, sizeof g_census); g_census_lost = 0;
+}
+void dm_vislog_sites_dump(const char *why, unsigned long long frame);   // hle_nvn.c: CallCommands / CopyCommands by call chain
+int dm_vislog_entries_dump(const char *why, unsigned long long frame);   // hle_nvn.c: the game's piece entries holding the logged draw (Ocarina of Time)
+int dm_vislog_units_dump(const char *why, unsigned long long frame);     // hle_nvn.c: the render queue's units pointing at that entry's object
+extern _Atomic uint64_t dm_vislog_recorded, dm_vislog_ended, dm_vislog_submitted, dm_vislog_restarted;   // hle_nvn.c: draws of the logged size at each stage from recording to submit
+static void vislog_summary(unsigned long long frame, const char *why) {
+    static uint64_t p_seen, p_drawn, p_rep, p_zero, p_cond, p_skip; static unsigned long long p_frame;
+    uint64_t seen = atomic_load(&g_vislog_seen), drawn = atomic_load(&g_vislog_draws), rep = atomic_load(&g_vislog_reports), zero = atomic_load(&g_vislog_zero), cond = atomic_load(&g_vislog_cond), skip = atomic_load(&g_vislog_skips);
+    MLOG("[vislog] %s frame %llu: the %d-index mesh recorded by the game %llu times, in ended recordings %llu, in recordings begun again unended %llu, submitted %llu; issued %llu times (%llu since frame %llu), encoded %llu (%llu), under a condition %llu (%llu; %llu unknown in all), dropped %llu (%llu); its queries reported %llu (%llu), 0 samples %llu (%llu); first issued at frame %llu, last at %llu",
+         why, frame, g_vislog, (unsigned long long)atomic_load(&dm_vislog_recorded), (unsigned long long)atomic_load(&dm_vislog_ended), (unsigned long long)atomic_load(&dm_vislog_restarted), (unsigned long long)atomic_load(&dm_vislog_submitted), (unsigned long long)seen, (unsigned long long)(seen - p_seen), p_frame, (unsigned long long)drawn, (unsigned long long)(drawn - p_drawn), (unsigned long long)cond, (unsigned long long)(cond - p_cond),
+         (unsigned long long)atomic_load(&g_vislog_cond_unknown), (unsigned long long)skip, (unsigned long long)(skip - p_skip), (unsigned long long)rep, (unsigned long long)(rep - p_rep), (unsigned long long)zero, (unsigned long long)(zero - p_zero),
+         (unsigned long long)atomic_load(&g_vislog_first), (unsigned long long)atomic_load(&g_vislog_last));
+    p_seen = seen; p_drawn = drawn; p_rep = rep; p_zero = zero; p_cond = cond; p_skip = skip; p_frame = frame;
+    dm_vislog_entries_dump(why, frame);
+    if (!(frame % 600) || why[0] == 's') { census_dump(frame, why); dm_vislog_sites_dump(why, frame); }
+    dm_vislog_units_dump(why, frame);   // each summary (150 frames): a launch whose world loads after a 600-frame mark is covered too
+}
 typedef struct { void *buf; uint32_t slot; } vis_slot;
 typedef struct { int n; vis_slot s[]; } vis_list;
 #define VIS_SLOTS 8192
@@ -1907,6 +2032,33 @@ static void mem_trim(void);
 static void pkg_sweep(void);
 static uint64_t spare_trim(int all, unsigned *n_out);
 static unsigned g_evict_why[5];   // the last trim's packages (pkg_evict_idle): considered, used within PKG_IDLE_DS, of a kind not freed (sparse, placed, a view), GPU-written, held (pin, sharing table, takeover)
+// kid-with-sword-remake L7.8: pools for the raw memory table made resident a few at a time, ahead of the table (DM_NVN_RES_TRICKLE_MB, default 16; 0 = off). Once a game has used raw
+// global memory (gmem_map built), every pool something gave an address in goes into the residency set when the table is next built: on an iPhone 18 Pro's first area load (L7.7 log)
+// 2,453 pools, 1,176 MB, in one commit of the frame that first drew the area, which stopped 784 ms (838 ms of commits in 300 frames). The game addresses them while it loads, frames
+// before that draw, so each submission here puts up to this many MB of them into the set (committed with the submission), largest first only in the sense of the pool order; the table
+// then finds them resident and adds what is left. A pool made resident early stays as gmem_map would leave it (the set holds addressed pools for good), so memory ends where it did, only
+// sooner; no lookup changes. Pools over 64 MB and large pools' chunks are left to the table, which gives a large pool one buffer of its own
+static int g_gmem_seen;   // set by gmem_map once a raw global memory table was built
+static _Atomic uint64_t g_trickle_n, g_trickle_bytes;
+static void res_trickle(void) {
+    static int mb = -1; static uint64_t frame = UINT64_MAX, used, gen_done;
+    if (mb < 0) { const char *e = getenv("DM_NVN_RES_TRICKLE_MB"); mb = e ? atoi(e) : 16; if (mb < 0) mb = 0; if (mb > 512) mb = 512; MLOG("DM_NVN_RES_TRICKLE_MB=%d: addressed pools %s", mb, mb ? "go into the residency set a few at a time ahead of the raw memory table" : "wait for the raw memory table"); }
+    if (!mb || !g_gmem_seen || mem_hot()) return;   // under memory pressure no pool is made resident ahead (mem_hot)
+    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed); if (f != frame) { frame = f; used = 0; }
+    uint64_t budget = (uint64_t)mb << 20, gen = atomic_load(&g_pool_gen);
+    if (gen == gen_done || used >= budget) return;
+    int done = 1;
+    pthread_mutex_lock(&g_mu);
+    for (int k = 0; k < g_npool; k++) {
+        pool_ent *p = &g_pools[k];
+        if (p->res || !p->buf || p->buf.length > (64u << 20) || big_of(p->lo) >= 0 || !addr_meets(p->lo, p->hi)) continue;   // a large pool's chunks: the table gives it one whole-pool buffer
+        if (used + p->buf.length > budget && used) { done = 0; break; }
+        res_add(p->buf); p->res = 1; g_pool_res_n++; used += p->buf.length;
+        atomic_fetch_add_explicit(&g_trickle_n, 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_trickle_bytes, p->buf.length, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (done) gen_done = gen;
+}
 void mtl_sub_begin(void) {
     mtl_init(); g_sub_serial++; g_seg = 0; g_vis_need = 1;   // until its first samples-passed reset or report (vis_need_scan)
     treg_sparse_notes();   // the mappings made before this submission
@@ -1915,6 +2067,7 @@ void mtl_sub_begin(void) {
     sub_cut_begin();
     defer_drain();
     rh_trim();
+    res_trickle();   // addressed pools ahead of the raw memory table (L7.8)
     tu_tick();   // the render targets drawn over since their last use go, once a second
     spare_trim(0, NULL);   // packaged textures' spares no re-upload took
     mem_trim();   // memory pressure asked for one (mem_pressure_event)
@@ -3002,7 +3155,9 @@ static void post_run(post_rec *r, uint64_t c0, uint64_t c1) {
             if (ops[i].mode == VIS_ZERO) { g_vis_acc = 0; continue; }
             vis_list *l = ops[i].vis;
             for (int k = 0; k < l->n; k++) { g_vis_acc += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
-            free(l); if (ops[i].mode == VIS_REPORT) { uint64_t rec[2] = {g_vis_acc, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec); nvn_shadow_writeback(ops[i].addr, sizeof rec); }
+            free(l); if (ops[i].mode == VIS_REPORT) { uint64_t rec[2] = {g_vis_acc + (vis_all_on() ? (g_vis_bias += 1u << 20) : 0), gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec); nvn_shadow_writeback(ops[i].addr, sizeof rec); vis_report_done(ops[i].addr);
+                if (ops[i].type & 0x80000000u) { uint64_t nr = atomic_fetch_add(&g_vislog_reports, 1) + 1; if (!g_vis_acc) atomic_fetch_add(&g_vislog_zero, 1);
+                    if (!g_vis_acc || nr % 30 == 1) MLOG("[vislog] frame %llu record %#llx: %llu samples passed (report %llu, %llu of them 0)", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)ops[i].addr, (unsigned long long)g_vis_acc, (unsigned long long)nr, (unsigned long long)atomic_load(&g_vislog_zero)); } }
         }
         else { uint64_t t = rep_ticks(&ops[i], sc, seg_last, c0, c1, off), rec[2] = {0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); nvn_shadow_writeback(ops[i].addr, sizeof rec); }   // a timestamp report's counter field is 0, as on the GPU (see rc_value)
     }
@@ -3208,7 +3363,7 @@ void mtl_finish(void) { mtl_finish_gpu_at(WS_FINISH); }
 static void present_drop_for_suspend(void);
 static void present_suspend_wait(void);
 static void snap_drain(int strict);
-void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_drain(1); mtl_init(); id<MTLCommandBuffer> cb = q_cb(); [cb commit]; [cb waitUntilCompleted]; mtl_finish_gpu(); }
+void mtl_drain(void) { if (g_vislog > 0) vislog_summary(atomic_load(&g_cur_frame), "suspend at"); present_drop_for_suspend(); mtl_present_flush(); snap_drain(1); mtl_init(); id<MTLCommandBuffer> cb = q_cb(); [cb commit]; [cb waitUntilCompleted]; mtl_finish_gpu(); }
 void mtl_suspend_drain(void) {
     @autoreleasepool {
         mtl_init();
@@ -5878,7 +6033,8 @@ static void *tex_mtl_resolve(const tex_t *ct, int *in_storage, id<MTLTexture> __
                 if (pk->spare && pk->spare != nt) defer_obj_release(pk->spare);   // still in use, or of another shape: retired as before
                 if (pk->sparse) sparse_view(pk, t);
                 zb_report(t, pk->sparse ? (unsigned)pk->vbase : 0, "re-upload");
-                pk->spare = old; pk->spare_fence = g_fence + 1; spare_note(pk); own_note(t->serial); pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = st; g_pkg_reuploads++; pkg_hash_take(pk, t); pkg_edges_take(pk, t); }
+                pk->spare = old; pk->spare_fence = g_fence + 1; spare_note(pk); own_note(t->serial); pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = st; g_pkg_reuploads++; pkg_hash_take(pk, t); pkg_edges_take(pk, t);
+                nvn_dirty_changed(t->mem, t->L.size); }   // really rewritten: its pages leave the hot path (compared, not protected) for protection again (T-141)
             if (nt && !pk->sparse) bcp_up_follow(t, nt);   // the CPU's bytes reach the other side of a compressed-alias pair too
             return tex_mtl_result(pk->view ? pk->view : pk->tex, owned);
         }
@@ -5990,6 +6146,43 @@ static void *tex_mtl_resolve(const tex_t *ct, int *in_storage, id<MTLTexture> __
 // The frame hook samples every 300 frames. For the first 400 reports, a change of at least 64 MB in resident or GPU allocated memory also triggers a report. After 400 reports, log every 3000 frames.
 // All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting).
 static _Atomic uint64_t g_gptr_bindings, g_gptr_reads, g_gptr_added, g_gptr_bytes;   // gmem_discover: bindings with sources, readable words, newly addressed logical pool/run ranges and bytes
+// kid-with-sword-remake L7.7 (DM_NVN_PREREAD): read a resource's guest memory back in the background as soon as the game sets it up. With the guest in files
+// (DM_GUEST_FILE) iOS writes what a load put into memory out to the files and may drop it from RAM; the GPU then needs it resident, and making it resident read it back from storage on the
+// submit thread in one go: an iPhone 18 Pro's first area load (L7.6 log) stopped 2.8 s in one frame that read 882 MB, then 0.9 and 0.8 s. Here each buffer and texture (hle_nvn.c
+// nvnBufferInitialize, nvnTextureInitialize: in a pool the CPU can reach, so with the game's data in it) asks the kernel to read its range ahead (madvise MADV_WILLNEED) on a utility
+// queue, while the load runs on. Advice only: nothing reads or writes the memory here, a range freed meanwhile only makes the call fail, and the GPU's view is unchanged. Ranges past
+// PREREAD_MAX are left out (a large pool read whole would crowd out what a load needs). The census line every 600 frames says how much was asked and how long the calls took
+enum { PREREAD_MAX = 64u << 20 };
+// Default on since L7.7 (the A/B on an iPhone 18 Pro, same save and world change: stalls over 100 ms 18 → 8, over 300 ms 9 → 1, the worst 1.18 s → 0.50 s, 7.0 → 1.9 s stalled
+// in all); DM_NVN_PREREAD=0 turns it off. The game makes small buffers again every frame over the same memory (3.5 million calls for 60 GB in 2.5 minutes in that test), so a range
+// asked within PREREAD_AGAIN_NS is not asked again: a slot per range start (PREREAD_SLOTS, by address) keeps its end and when; races between threads only ask once more or once less,
+// which advice allows. Pools are read ahead when made too (hle_nvn.c nvnMemoryPoolInitialize): the 0.5 s stall left read 459 MB that no buffer or texture had named
+enum { PREREAD_SLOTS = 4096 }; static const uint64_t PREREAD_AGAIN_NS = 2000000000ull;
+static struct { _Atomic uintptr_t a, b; _Atomic uint64_t t; } g_preread_seen[PREREAD_SLOTS];
+static int g_preread = -1; static _Atomic uint64_t g_preread_n, g_preread_bytes, g_preread_ns, g_preread_fail, g_preread_skip;
+static int preread_on(void) { if (g_preread < 0) { const char *e = getenv("DM_NVN_PREREAD"); g_preread = !e || atoi(e) > 0; MLOG("DM_NVN_PREREAD=%d: pools, buffers and textures are %sread ahead in the background when the game sets them up", g_preread, g_preread ? "" : "not "); } return g_preread; }
+void mtl_preread(const void *mem, uint64_t size) {
+    if (!mem || !size || size > PREREAD_MAX || !preread_on()) return;
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("dm.preread", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
+    uintptr_t pg = (uintptr_t)getpagesize(), a = (uintptr_t)mem & ~(pg - 1), b = ((uintptr_t)mem + size + pg - 1) & ~(pg - 1);
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); unsigned k = (unsigned)((a >> 12) * 0x9E3779B1u) % PREREAD_SLOTS;
+    if (atomic_load_explicit(&g_preread_seen[k].a, memory_order_relaxed) == a && atomic_load_explicit(&g_preread_seen[k].b, memory_order_relaxed) >= b &&
+        now - atomic_load_explicit(&g_preread_seen[k].t, memory_order_relaxed) < PREREAD_AGAIN_NS) { atomic_fetch_add_explicit(&g_preread_skip, 1, memory_order_relaxed); return; }
+    atomic_store_explicit(&g_preread_seen[k].a, a, memory_order_relaxed); atomic_store_explicit(&g_preread_seen[k].b, b, memory_order_relaxed); atomic_store_explicit(&g_preread_seen[k].t, now, memory_order_relaxed);
+    atomic_fetch_add(&g_preread_n, 1); atomic_fetch_add(&g_preread_bytes, b - a);
+    dispatch_async(q, ^{
+        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (madvise((void *)a, b - a, MADV_WILLNEED)) atomic_fetch_add(&g_preread_fail, 1);
+        atomic_fetch_add(&g_preread_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+    });
+}
+static void preread_report(unsigned long long frame) {
+    if (atomic_load(&g_trickle_n)) MLOG("[trickle] up to frame %llu: %llu pools, %.0f MB put into the residency set ahead of the raw memory table", frame, (unsigned long long)atomic_load(&g_trickle_n), atomic_load(&g_trickle_bytes) / 1048576.0);
+    if (g_preread <= 0) return;
+    MLOG("[preread] up to frame %llu: %llu ranges, %.0f MB asked to be read ahead, %.1f ms in the calls, %llu failed (range gone), %llu skipped (asked within 2 s)", frame, (unsigned long long)atomic_load(&g_preread_n),
+         atomic_load(&g_preread_bytes) / 1048576.0, atomic_load(&g_preread_ns) / 1e6, (unsigned long long)atomic_load(&g_preread_fail), (unsigned long long)atomic_load(&g_preread_skip));
+}
 // The pools in the residency set and why (L7.2.1, diagnostic, every 600 frames): a pool's zero-copy buffer in the set wires every page of it, and on an iPhone that is charged to the app's
 // footprint (the graphics ledger: 2.4-3.9 GB of Ocarina of Time's 3.4-5.2 GB on an iPhone 18 Pro). n_tex_reads / n_other: the first lookups of each pool by texture uploads and by
 // everything else (draw bindings, copies, the raw memory table); a pool only texture uploads reached holds what the GPU samples from host textures, not from the pool
@@ -6020,7 +6213,8 @@ static void pool_census(unsigned long long frame) {
 }
 static _Atomic uint64_t g_lib_data_n, g_lib_data_bytes, g_lib_data_fails, g_lib_data_fail_bytes;
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
-    if (!(frame % 600)) pool_census(frame);
+    if (!(frame % 600)) { pool_census(frame); preread_report(frame); }
+    if (g_vislog > 0 && !(frame % 150)) vislog_summary(frame, "up to");
     static unsigned long long last_rss, last_gpu, last_frame, last_wired; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
     sys_mem_t sm = sys_mem();
     unsigned long long dr = rss_mb > last_rss ? rss_mb - last_rss : last_rss - rss_mb, dg = gpu > last_gpu ? gpu - last_gpu : last_gpu - gpu, dw = sm.wired > last_wired ? sm.wired - last_wired : last_wired - sm.wired;
@@ -9328,7 +9522,7 @@ static void prog_resolve(void) {
 }
 static int g_state_inited;
 static void state_reset(void) {
-    g_rc_skip=0;
+    g_rc_skip=0; g_rc_last.mode = -1;
     g_state_inited = 1;
     memset(&S, 0, sizeof S);
     g_pso_dirty = g_dss_dirty = 1;
@@ -10121,8 +10315,22 @@ static id<MTLFunction> typed_fn(NvShader *fs, uint32_t cls, int at, int lo, int 
 // reference are data, not part of the pipeline: one pipeline serves every function, and a draw that changes the reference every frame (a dissolve) keeps it. As in OpenGL,
 // there is no test when colour 0 goes to an integer target
 static inline int atest_on(void) { return S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS; }
+// DM_NVN_ATEST_OFF=<fragment shader key prefix>,... (diagnostic, kid-with-sword-remake L7.9 test): those draws go without the alpha test, and the function and reference they asked for
+// are logged (the first 8 times per key): a Goku mod's body (Ocarina of Time, fragment 47e804143a060733) drew nothing on some starts while a solid-colour fragment in its place drew
+static int atest_off(NvShader *fs) {
+    static char keys[6][24]; static int nk = -1; static int said[6];
+    if (nk < 0) { nk = 0; const char *e = getenv("DM_NVN_ATEST_OFF");
+        for (const char *q = e; q && *q && nk < 6; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 23) n = 23; memcpy(keys[nk], q, n); keys[nk++][n] = 0; }
+        if (nk) MLOG("DM_NVN_ATEST_OFF: %d fragment shader key(s) drawn without the alpha test", nk); }
+    for (int i = 0; i < nk && fs; i++) if (!strncmp(fs->key, keys[i], strlen(keys[i]))) {
+        if (said[i]++ < 8) { float r; memcpy(&r, &S.alpha_ref, 4); MLOG("DM_NVN_ATEST_OFF: %s asked for alpha function %u reference %g (has an alpha entry %d); drawn without the test", fs->key, S.color.alpha_func, r, fs->has_alpha); }
+        return 1; }
+    return 0;
+}
 static uint32_t atest_key(NvShader *fs, const uint32_t cfmt[8], const uint8_t *lmap) {   // pso_key.atest; lmap: a merged pass's physical → logical targets
-    if (!fs || !atest_on()) return 0;
+    if (!fs) return 0;
+    int off = atest_off(fs);   // logs what the draw asked for even when it has no test
+    if (!atest_on() || off) return 0;
     // Comparisons consume SPH output-0 alpha (word 18 bit 3), not an MSL float4's padding. As in Ryujinx EmitterContext.PrepareForReturn, NEVER is unconditional.
     if (S.color.alpha_func != NVN_ALPHA_FUNC_NEVER && fs->rf.omap_known && !(fs->rf.omap & 8)) return 0;
     for (int i = 0; i < 8; i++) if (cfmt[i] && (lmap ? lmap[i] : i) == 0 && pf_int_kind((MTLPixelFormat)cfmt[i])) return 0;
@@ -12524,12 +12732,12 @@ static id<MTLRenderPipelineState> pso_nw_get(const pso_key *k, NvShader *vs, NvS
     if (!v) {
         g_nw[kd] = NSNull.null; *fresh = 1;
         MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); int off = !k->border;
-        dispatch_async(nw_queue(), ^{
+        dispatch_async(nw_queue(), ^{ @autoreleasepool {   // drained after each build, as the other background builds (upstream de348580, PR #2714)
             dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
             NSError *e = nil; id<MTLRenderPipelineState> built = pso_build(d, off, &e);
             dispatch_semaphore_signal(sem);
             pthread_mutex_lock(&g_nw_mu); g_nw[kd] = built ? (id)built : (id)g_nw_failed; pthread_cond_broadcast(&g_nw_cv); pthread_mutex_unlock(&g_nw_mu);
-        });
+        } });
         v = NSNull.null;
     }
     uint64_t budget = (uint64_t)(nw_budget_ms() * 1e6);
@@ -13981,7 +14189,7 @@ static uint64_t pool_walk(int samp, int dtt, int dpf, int base, __unsafe_unretai
 // the next submission starts a new epoch and every texture ID takes the slow path (ser_sync): on an iPhone 18 Pro after an area change, when about 100 targets a second went,
 // that was a 120-250 ms frame once a second (logs 42, 46, 47; none with DM_NVN_RT_DEAD=0, log 48). 32 stays under the notes with room for the ghost trim's (GHOST_TRIM), and
 // five passes a second still free up to 160
-enum { TU_IDLE = 30, TU_MAX_DEF = 32, TU_EVERY_DEF = 2 };   // deciseconds; textures a pass; deciseconds between passes
+enum { TU_IDLE = 30, TU_IDLE_HOT = 10, TU_MAX_DEF = 32, TU_EVERY_DEF = 2 };   // deciseconds (TU_IDLE_HOT: under memory pressure, mem_hot); textures a pass; deciseconds between passes
 // DM_NVN_RT_DEAD_MAX / DM_NVN_RT_DEAD_EVERY override the two (for A/B runs: 256 and 10 are the pacing before L6.3)
 static uint32_t tu_env(const char *name, uint32_t def) { const char *e = getenv(name); int v = e && *e ? atoi(e) : 0; return v > 0 ? (uint32_t)v : def; }
 #define TU_MAX (tu_env("DM_NVN_RT_DEAD_MAX", TU_MAX_DEF))
@@ -14011,7 +14219,7 @@ static void tu_pass(void) { @autoreleasepool {
     if (!g_tu.n) return;
     uint64_t *sers = NULL; uint32_t nser = 0;
     pthread_mutex_lock(&g_smu);
-    own_dead_stats st = own_alias_dead_locked(now, TU_IDLE, tu_use_of, TU_MAX, &sers, &nser);
+    own_dead_stats st = own_alias_dead_locked(now, mem_hot() ? TU_IDLE_HOT : TU_IDLE, tu_use_of, TU_MAX, &sers, &nser);   // 1 s under memory pressure (mem_hot)
     pthread_mutex_unlock(&g_smu);
     if (nser) {
         os_unfair_lock_lock(&g_rmu);
@@ -14329,6 +14537,7 @@ static id<MTLBuffer> gmem_map(void) {
     uint64_t gen = atomic_load(&g_pool_gen);
     if (g_gmem_buf && g_gmem_gen == gen) return g_gmem_buf;
     id<MTLBuffer> b = [g_dev newBufferWithLength:DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY options:MTLResourceStorageModeShared];
+    g_gmem_seen = 1;   // res_trickle may start
     uint8_t *t = (uint8_t *)b.contents; memset(t, 0, b.length);
     for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
     int n = 1, over = 0; uint64_t end = 0;
@@ -17571,6 +17780,7 @@ static int rt_has_depth(void) {
 static void draw(const p_draw *dw, const p_draw_idx *di) { cp_stamp start = cp_begin(); if (dw && dw->prim == DM_PRIM_MESH_TASKS) mesh_tasks_draw(dw); else draw_(dw, di); cp_end(5, start); }
 static void draw_(const p_draw *dw, const p_draw_idx *di) {
     g_draw_binst = (uint32_t)(dw ? dw->base_instance : di ? di->base_instance : 0);   // c0 + 0x644 of the stages that read the driver segment (encode_args)
+    if (vislog_on() && (int)(dw ? dw->count : di->count) == g_vislog) { g_vislog_mark = 1; atomic_fetch_add_explicit(&g_vislog_draws, 1, memory_order_relaxed); }   // DM_NVN_VISLOG
     if (passdump()) { NvProg *p = g_geo_program ? g_geo_program : S.prog ? prog_get(S.prog) : nil;
         PD("j %llu draw-entry vs=%s fs=%s gs=%s prim=%d count=%d instances=%d indexed=%d indirect=%#llx discard=%d feedback=%d", g_stat_pass + !g_enc,
            p && p->sh[0] ? p->sh[0]->key : "-", p && p->sh[1] ? p->sh[1]->key : "-", p && p->sh[2] ? p->sh[2]->key : "-",
@@ -19673,19 +19883,25 @@ void mtl_exec(const uint8_t *p) {
                     if (!g_vis_on) {   // a report with no reset before it: the counter runs from the queue's creation, so counting starts here (Occlusion queries)
                         g_vis_on = 1; g_vis_counting = 1; MLOG("occlusion queries: samples passed reported with no ResetCounter before it: counting from this report");
                         if (g_enc && !g_enc_has_vis) { PD("M %llu occlusion query counting starts at a report: render pass split here", g_stat_pass); rp_end(); } }
-                    nvn_shadow_arm(ad, 16); hw_note(ad); post((post_op){3, NULL, VIS_REPORT, 0, ad, (uint32_t)t, vis_snapshot()}); vis_clear(); vis_need_scan(p + h.size); }   // written at completion, as a counter report
+                    nvn_shadow_arm(ad, 16); hw_note(ad); post((post_op){3, NULL, VIS_REPORT, 0, ad, (uint32_t)t | (g_vislog_mark ? 0x80000000u : 0), vis_snapshot()}); g_vislog_mark = 0; vis_clear(); vis_need_scan(p + h.size); }   // written at completion, as a counter report
                 else mtl_sub_counter(ad, (uint32_t)t);
                 break; }
             case OP_RENDER_COND: { const p_render_cond *rc = a;   // SetRenderEnable / SetRenderEnableConditional (hle_nvn.c)
-                if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; PD("E %llu render enable %d", g_stat_pass, rc->mode == 2); }
+                if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; g_rc_last.would = 0; g_rc_last.mode = -1; PD("E %llu render enable %d", g_stat_pass, rc->mode == 2); }
                 else { uint64_t x = 0, y = 0; int known = rc_value(rc->addr, &x) & rc_value(rc->addr + 16, &y);
                     g_rc_skip = known && (rc->mode ? x == y : x != y);
+                    if (vislog_on()) { g_rc_last.mode = rc->mode; g_rc_last.known = known; g_rc_last.would = g_rc_skip; g_rc_last.addr = rc->addr; g_rc_last.x = x; g_rc_last.y = y;
+                        for (int k = 0; k < 2; k++) { uint64_t ra = rc->addr + 16 * k; rc_report *rr = rc_find(ra); uint64_t *m = k ? g_rc_last.my : g_rc_last.mx;
+                            m[0] = *(const volatile uint64_t *)ra; m[1] = *(const volatile uint64_t *)(ra + 8);
+                            (k ? &g_rc_last.fy : &g_rc_last.fx)[0] = rr ? 1 | rr->reported << 1 | rr->conservative << 2 | rr->readable << 3 | rr->gpu_domain << 4 | rr->unreliable << 5 | (rr->known == 255) << 6 | rr->dirty << 7 | (rr->fence > atomic_load(&g_rc_complete)) << 8 : 0; } }
+                    if (g_rc_skip && rc_draw_on()) g_rc_skip = 0;
                     PD("E %llu conditional render %s addr=%#llx values %llu / %llu%s%s", g_stat_pass, rc->mode ? "draw if not equal" : "draw if equal", (unsigned long long)rc->addr, (unsigned long long)x, (unsigned long long)y, known ? "" : " (unknown, drawn)", g_rc_skip ? " → not drawn" : ""); }
                 break; }
             case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_fence + 1; s->fenced = 1;   // the fence value this submission (segment) commits with
                 PD("Y fence_sync cmd=%p sync=%p fence=%llu", p, (void *)s, (unsigned long long)s->fence); break; }
             case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); g_cnt_reset[t & 31]++; PD("Q reset type=%llu cmd=%p", (unsigned long long)t, p);
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
+                    g_vislog_mark = 0;
                     g_vis_on = 1; g_vis_counting = 1; vis_clear(); post((post_op){3, NULL, VIS_ZERO, 0, 0, (uint32_t)t, NULL}); vis_need_scan(p + h.size);
                     // The first reset can come inside a render pass that was begun without a visibility buffer (Octopath Traveler 0: Unreal's occlusion queries, once at boot): split the pass
                     // here, so the continuation is begun with the buffer and its samples are counted (they used not to be: RED "occlusion query counting began in a pass without a visibility buffer")
@@ -19768,7 +19984,8 @@ void mtl_exec(const uint8_t *p) {
                 break;
             case OP_DRAW: { if (g_rc_skip) break; if (g_fsm_ntaken && fsm_take(p)) { PD("L %llu face-split draw already drawn in an earlier pass (DM_NVN_FACE_MERGE)", g_stat_pass); break; }
                 p_draw t; g_exec_cur = p; g_exec_next = p + h.size; draw(draw_rec(a, h.size, &t), NULL); g_exec_next = NULL; break; }   // Lookahead start point
-            case OP_DRAW_IDX: { if (g_rc_skip) break; if (g_fsm_ntaken && fsm_take(p)) { PD("L %llu face-split draw already drawn in an earlier pass (DM_NVN_FACE_MERGE)", g_stat_pass); break; }
+            case OP_DRAW_IDX: { if (vislog_on()) { p_draw_idx lt; const p_draw_idx *ld = draw_idx_rec(a, h.size, &lt); census_add((uint32_t)ld->count); if (ld->count == g_vislog) { uint64_t fr = atomic_load(&g_cur_frame); if (!atomic_fetch_add(&g_vislog_seen, 1)) atomic_store(&g_vislog_first, fr); atomic_store(&g_vislog_last, fr); vislog_cond(g_rc_skip, ld->ind != 0); } }
+                if (g_rc_skip) break; if (g_fsm_ntaken && fsm_take(p)) { PD("L %llu face-split draw already drawn in an earlier pass (DM_NVN_FACE_MERGE)", g_stat_pass); break; }
                 p_draw_idx t; g_exec_cur = p; g_exec_next = p + h.size; draw(NULL, draw_idx_rec(a, h.size, &t)); g_exec_next = NULL; break; }
             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
             case OP_BIND_PROGRAM: { const p_bind_program *b = a; state_op(h.op,a);

@@ -145,6 +145,7 @@ SWITCH_BINDING = [
     ('pad_theme', '', {'what': 'default on-screen touch controls colour theme', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': 'a visual theme choice per game'}),
     ('pool_skip_retired', '', {'what': 'pool tables give retired texture IDs without a view the dummy', 'now': 'game', 'goal': 'game', 'purpose': 'memory', 'why': 'avoids re-creating textures for finalized IDs left registered in the pool'}),
     ('upscaler_chain', '', {'what': 'multi-stage upscaler shader chain replaced by MetalFX', 'now': 'game', 'goal': 'game', 'purpose': 'rendering', 'why': "the game's own NDSR shader keys for each resolution scale"}),
+    ('mod_input_hold', '', {'what': 'hold guest input after start while mods are active', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': 'avoids triggering early input before modded assets finish loading'}),
 ]
 
 

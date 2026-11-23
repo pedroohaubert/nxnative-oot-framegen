@@ -315,6 +315,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     if (!o->mem && (o->flags & 0x200)) { uint8_t *vr = vpool_reserve(o); if (vr) o->mem = vr; }   // a virtual pool's own address range until its first mapping decides (see MapVirtual)
     else if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
     if (o->mem && !(o->flags & 0x200)) dm_device_share(share_mem, o->size, 1);   // the GPU maps the storage: the host refuses to unmap it until Finalize, as Horizon does (hle_svc.c)
+    if (o->mem && !(o->flags & (0x200 | NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS))) mtl_preread(o->mem, o->size);   // a pool is usually made over data a load just put there: back from the guest files ahead of the GPU (DM_NVN_PREREAD)
     if (!o->mem && !(o->flags & 0x200)) LOG("[RED] MemoryPoolInitialize: non-virtual pool has no storage flags=%#x size=%#llx", o->flags, o->size);
     if (getenv("DM_NVN_VLOG")) { LOG("[nvn] MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, (unsigned long long)o->size, o->flags); void dm_backtrace(uint64_t fp); dm_backtrace((uint64_t)__builtin_frame_address(0)); }
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
@@ -670,6 +671,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     if (s->pool) vpool_taken(s->pool);
     o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
     o->serial = nvn_new_serial(); mtl_tex_init(o);
+    if (o->mem && !s->pkg_data && !(s->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | 0x200))) mtl_preread(o->mem, o->L.size);   // its data back from the guest files ahead of the GPU's first use (DM_NVN_PREREAD)
     {   // DM_NVN_TEXINFO=WxH also logs every texture of that size as it is initialized (render targets included): which ones share storage, and how their descriptions differ
         static int ti = -1; static uint32_t tw, th;
         if (ti < 0) { const char *e = getenv("DM_NVN_TEXINFO"); ti = e && sscanf(e, "%ux%u", &tw, &th) == 2; }
@@ -1257,11 +1259,202 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
 // A recording starts with its first command, as in NVN: no BEGIN record, and an empty recording takes no command memory, only its control entry. Games size command memory by
 // GetCommandMemoryUsed (nvn_obj.h draw_rec): Breath of the Wild sums one scratch recording per mesh and per shape and render pass into each model's prerecorded commands, and with an
 // 8-byte BEGIN on each of several hundred recordings a model came out a 4 KB page over its resource size table entry
+// DM_NVN_VISLOG (diagnostic, kid-with-sword-remake L7.9): a draw of the logged size followed from recording to replay. Test 13: the game recorded the Goku mod's body
+// six times after a world load and the replay met none. Recordings holding one (by command buffer and recording serial), the handles their EndRecording gave, and how many of
+// them each stage saw: recorded (vislog_rec), in a recording that ended, submitted (nq_record_one), replayed (nvn_mtl.m); a recording begun again before it ended, and a
+// handle called or copied into another recording, are logged
+enum { VL_SLOTS = 64 };
+static struct { const void *cb; uint32_t rec_id, marks; } g_vl_cb[VL_SLOTS];
+static struct { uint64_t handle; uint32_t rec_id, marks; } g_vl_h[VL_SLOTS]; static unsigned g_vl_h_next;
+static pthread_mutex_t g_vl_mu = PTHREAD_MUTEX_INITIALIZER;
+static const void *g_vl_end_cb; static _Atomic unsigned g_vl_used_logs;   // the command buffer that last ended a recording holding the logged draw (vl_used)
+_Atomic uint64_t dm_vislog_recorded, dm_vislog_ended, dm_vislog_submitted, dm_vislog_restarted;
+static int vislog_want(void) { static int want = -1; if (want < 0) { const char *e = getenv("DM_NVN_VISLOG"); want = e ? atoi(e) : 0; } return want; }
+static int vl_cb_find(const void *cb, int add) {   // under g_vl_mu
+    int fr = -1; for (int i = 0; i < VL_SLOTS; i++) { if (g_vl_cb[i].cb == cb) return i; if (fr < 0 && !g_vl_cb[i].cb) fr = i; }
+    if (add && fr >= 0) { g_vl_cb[fr].cb = cb; g_vl_cb[fr].rec_id = 0; g_vl_cb[fr].marks = 0; }
+    return add ? fr : -1;
+}
+static void vl_mark(const cmd_t *o, const void *cb, uint32_t marks) {   // marks draws of the logged size as recorded into o's current recording
+    pthread_mutex_lock(&g_vl_mu); int i = vl_cb_find(cb, 1);
+    if (i >= 0) { if (g_vl_cb[i].rec_id != o->rec_id) { g_vl_cb[i].rec_id = o->rec_id; g_vl_cb[i].marks = 0; } g_vl_cb[i].marks += marks; }
+    pthread_mutex_unlock(&g_vl_mu);
+}
+static void vl_begin(const cmd_t *o, const void *cb) {   // a recording begun on cb: one still holding marked draws never ended
+    if (vislog_want() <= 0) return;
+    pthread_mutex_lock(&g_vl_mu); int i = vl_cb_find(cb, 0); uint32_t m = 0, id = 0;
+    if (i >= 0) { m = g_vl_cb[i].marks; id = g_vl_cb[i].rec_id; g_vl_cb[i].cb = NULL; }
+    if (g_vl_end_cb == cb) g_vl_end_cb = NULL;   // a new recording: later reads are about it
+    pthread_mutex_unlock(&g_vl_mu);
+    if (m) { uint64_t k = atomic_fetch_add(&dm_vislog_restarted, m) + m; LOG("[vislog] recording %u of command buffer %p, holding %u draws of %d indices, was begun again (now %u) without EndRecording at frame %llu (%llu such draws so far)", id, cb, m, vislog_want(), o->rec_id, (unsigned long long)dm_nvn_frame_count(), (unsigned long long)k); }
+}
+static void vl_end(const cmd_t *o, const void *cb, uint64_t handle) {   // the recording ended: its marked draws go with its handle
+    if (vislog_want() <= 0) return;
+    pthread_mutex_lock(&g_vl_mu); int i = vl_cb_find(cb, 0); uint32_t m = 0, id = 0;
+    if (i >= 0 && g_vl_cb[i].rec_id == o->rec_id) { m = g_vl_cb[i].marks; id = g_vl_cb[i].rec_id; }
+    if (i >= 0) g_vl_cb[i].cb = NULL;
+    if (m) { unsigned k = g_vl_h_next++ % VL_SLOTS; g_vl_h[k].handle = handle; g_vl_h[k].rec_id = id; g_vl_h[k].marks = m; g_vl_end_cb = cb; }
+    pthread_mutex_unlock(&g_vl_mu);
+    if (m) { static _Atomic unsigned nlog; atomic_fetch_add(&dm_vislog_ended, m); if (atomic_fetch_add(&nlog, 1) < 12) LOG("[vislog] recording %u of command buffer %p ended at frame %llu holding %u draws of %d indices: handle %#llx", id, cb, (unsigned long long)dm_nvn_frame_count(), m, vislog_want(), (unsigned long long)handle); }
+}
+static uint32_t vl_handle(uint64_t handle, uint32_t *rec_id) {   // the marked draws an ended recording's handle holds (0: none known)
+    uint32_t m = 0; pthread_mutex_lock(&g_vl_mu);
+    for (int i = 0; i < VL_SLOTS; i++) if (g_vl_h[i].handle == handle && g_vl_h[i].marks) { m = g_vl_h[i].marks; if (rec_id) *rec_id = g_vl_h[i].rec_id; break; }
+    pthread_mutex_unlock(&g_vl_mu); return m;
+}
+// DM_NVN_VISLOG, Ocarina of Time only (kid-with-sword-remake L7.9): the game's own record of a piece whose draw is logged. Its setup (main+0x273890) records each piece entry of a
+// model object (0x270 bytes each, the array at +0x638, the count in the byte at +0x69c) into a command buffer of its own, keeps the handle at entry +0x50, reads
+// GetControlMemoryUsed into +0x4c and GetCommandMemoryUsed into +0x2c, and sets bit 0 of +0x58 when either is not 0; every frame its render queue calls the handle only
+// while that bit is set (main+0x6d938). Recording the draw, main+0x27fef0 (its call returns to main+0x273ba0) saved that function's x21 (the entry index) at x29+0x38 and x20
+// (the object) at x29+0x40, so the draw's first game frame names the entry; dm_vislog_entries_dump reads it back each summary, on launches where the piece shows and where not
+enum { VL_ENTS = 8, VL_ENT_RA = 0x273ba0, VL_ENT_ARRAY = 0x638, VL_ENT_SIZE = 0x270, VL_ENT_COUNT = 0x69c };
+typedef struct { uint64_t obj, idx; uint32_t rec_id; } vl_ent;
+static vl_ent g_vl_ent[VL_ENTS]; static int g_vl_nent; static uint64_t g_vl_ent_frame;   // the frame the first entry was noted
+static int vl_rd16(uint64_t f, uint64_t rec[2]);
+static int vl_pc_name(char *out, size_t n, uint64_t pc);
+static int vl_rd(uint64_t a, void *out, size_t n) { vm_size_t got = 0; return a && !vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)out, &got) && got == n; }
+static void vl_entry_note(void *fp, uint32_t rec_id) {
+    if (!fp) return;
+    uint64_t f = *(const uint64_t *)fp, rec[2], sv[2];   // this function's own frame record: its saved x29 is the game's frame (tail-jump thunk)
+    if (!f || (f & 15) || !vl_rd16(f, rec)) return;
+    module_t *m = module_of((const void *)(uintptr_t)rec[1]);
+    if (!m || strcmp(m->name, "main") || rec[1] - (uint64_t)(uintptr_t)m->base != VL_ENT_RA || !vl_rd16(f + 0x38, sv)) return;
+    pthread_mutex_lock(&g_vl_mu);
+    int i = 0; while (i < g_vl_nent && !(g_vl_ent[i].obj == sv[1] && g_vl_ent[i].idx == sv[0])) i++;
+    if (i == g_vl_nent && g_vl_nent < VL_ENTS) { if (!g_vl_nent) g_vl_ent_frame = dm_nvn_frame_count(); g_vl_ent[i].obj = sv[1]; g_vl_ent[i].idx = sv[0]; g_vl_nent++; }
+    if (i < VL_ENTS) g_vl_ent[i].rec_id = rec_id;
+    pthread_mutex_unlock(&g_vl_mu);
+}
+// The structures that point at an object: a pass over [lo, hi) for 8-byte words equal to target, page by page, only pages in memory (mincore), each read through vm_read
+// (a resident page may still be protected, and a read through vm_read fails instead of faulting). Returns the hits found (up to max)
+static int vl_scan_refs(uint64_t target, uint64_t lo, uint64_t hi, uint64_t *hits, int max) {
+    enum { CH = 1u << 20 }; static uint8_t page[16384]; size_t pg = (size_t)getpagesize(); if (pg > sizeof page || hi <= lo) return 0;
+    int n = 0; lo &= ~(uint64_t)(pg - 1);
+    for (uint64_t a = lo, len; a < hi && n < max; a += len) {
+        len = hi - a < CH ? ((hi - a + pg - 1) & ~(uint64_t)(pg - 1)) : CH;
+        char vec[CH / 4096]; if (mincore((void *)(uintptr_t)a, len, vec)) continue;   // not mapped (in part): skip the chunk
+        for (size_t k = 0; k < len / pg && n < max; k++) {
+            if (!(vec[k] & 1)) continue;
+            uint64_t pa = a + k * pg; if (!vl_rd(pa, page, pg)) continue;
+            for (size_t o = 0; o < pg && n < max; o += 8) { uint64_t v; memcpy(&v, page + o, 8); if (v == target) hits[n++] = pa + o; }
+        }
+    }
+    return n;
+}
+// The same pass over every readable region of the guest range [lo, hi) (mach_vm_region), for the structures that may lie anywhere in the game's heap
+static int vl_scan_all(uint64_t target, uint64_t lo, uint64_t hi, uint64_t *hits, int max) {
+    int n = 0; vm_address_t a = (vm_address_t)lo;   // vm_region_64 (mach/mach.h): mach_vm.h is not for iOS
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    while (a < hi && n < max && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0 < 2000000000ull) {   // at most 2 s: a diagnostic must not stall the game long
+        vm_size_t sz = 0; vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
+        if (vm_region_64(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS || a >= hi) break;
+        if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+        uint64_t e = a + sz < hi ? a + sz : hi;
+        if (info.protection & VM_PROT_READ) n += vl_scan_refs(target, a, e, hits + n, max - n);
+        a += sz;
+    }
+    return n;
+}
+// A render queue draw unit (main+0x6fc00, the filter the queue asks before drawing a unit in a pass): the program index of each pass slot is the signed byte at +0x3b + slot
+// (-1: a default program), the program table is at +0x60 with +0x5f bytes a row, and a row whose first word is 0 makes the filter return false, so the unit is not drawn in that
+// pass (main+0x73cbc). Checks the layout, logs the unit, and returns how many of its slots name a row with no program (-1 when it is not such a unit)
+static int vl_unit_dump(uint64_t u, const char *why, unsigned long long frame) {
+    uint8_t b[0x70]; if (!vl_rd(u, b, sizeof b)) return -1;
+    uint64_t tab; memcpy(&tab, b + 0x60, 8); unsigned stride = b[0x5f];
+    if (!stride || stride > 0x100 || tab < 0x1000000 || (tab & 7)) return -1;
+    char line[900]; int q = snprintf(line, sizeof line, "[vislog] %s frame %llu: draw unit %#llx: bytes +0x18..+0x1f", why, frame, (unsigned long long)u);
+    for (int k = 0x18; k < 0x20; k++) q += snprintf(line + q, sizeof line - q, " %02x", b[k]);
+    q += snprintf(line + q, sizeof line - q, ", +0x2c..+0x4b"); for (int k = 0x2c; k < 0x4c; k++) q += snprintf(line + q, sizeof line - q, " %02x", b[k]);
+    q += snprintf(line + q, sizeof line - q, ", +0x54..+0x5f"); for (int k = 0x54; k < 0x60; k++) q += snprintf(line + q, sizeof line - q, " %02x", b[k]);
+    q += snprintf(line + q, sizeof line - q, "; program table %#llx (%u bytes a row):", (unsigned long long)tab, stride);
+    int nulls = 0;
+    for (int slot = 0; slot < 16 && q < (int)sizeof line - 40; slot++) {
+        int8_t idx = (int8_t)b[0x3b + slot]; if (idx < 0) continue;
+        uint64_t prog = 0; int ok = vl_rd(tab + (uint64_t)idx * stride, &prog, 8);
+        q += snprintf(line + q, sizeof line - q, " slot %d row %d %s", slot, idx, !ok ? "unreadable" : prog ? "program" : "NO PROGRAM");
+        nulls += ok && !prog;
+    }
+    LOG("%s", line);
+    uint64_t w[64]; if (vl_rd(u, w, sizeof w))   // the whole first 0x200 bytes, for a launch-to-launch diff
+        for (int r = 0; r < 64; r += 8) LOG("[vislog]     unit %#llx +0x%03x: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx", (unsigned long long)u, r * 8,
+            (unsigned long long)w[r], (unsigned long long)w[r+1], (unsigned long long)w[r+2], (unsigned long long)w[r+3], (unsigned long long)w[r+4], (unsigned long long)w[r+5], (unsigned long long)w[r+6], (unsigned long long)w[r+7]);
+    return nulls;
+}
+// DM_NVN_VISLOG (Ocarina of Time): the render queue reaches a piece entry through a draw unit whose +0x68 is the piece object (main+0x6d8c4). One scan of the guest range finds the
+// units naming a logged entry's object and the structures naming each unit at +0x10, g_vl_scan_delay frames after the entry was noted (a scan takes 2-3 s on an iPhone, and run
+// during the world's load it could shift the very timing under test), never at a suspend; the summaries after it re-read what it found. On a launch where the Goku body is not
+// drawn, the structure 0x1bb0 below its unit holds a quiet NaN (0x7fc00000) at +0 (test 19/20). DM_NVN_NANFIX=<value> (test) writes that value there while it holds that NaN
+enum { VL_UNITS = 4, VL_REFS = 8 };
+static struct { uint64_t u, ref[VL_REFS]; int nref; } g_vl_unit[VL_UNITS]; static int g_vl_nunit = -1;   // -1: not scanned yet
+// The wait is 120 frames: the game draws the piece (or not) from about 80 frames after it records it, when the world appears, and the owner's test runs end 180-280 frames
+// after that recording (300 missed both launches of test 21); DM_NVN_VISLOG_DELAY=<frames> changes it
+static uint64_t g_vl_lo = 0x7000000000ull, g_vl_hi = 0x7800000000ull; static int g_vl_scan_delay = -1;   // the guest range and the wait before the scan (unit tests change them)
+static unsigned vl_scan_delay(void) { if (g_vl_scan_delay < 0) { const char *e = getenv("DM_NVN_VISLOG_DELAY"); g_vl_scan_delay = e && *e ? atoi(e) : 120; if (g_vl_scan_delay < 0) g_vl_scan_delay = 0; } return (unsigned)g_vl_scan_delay; }
+static unsigned long long g_vl_last_scan; static _Atomic unsigned g_vl_nanfix_logs;
+static int vl_nanfix(float *v) {
+    static int on = -1; static float val;
+    if (on < 0) { const char *e = getenv("DM_NVN_NANFIX"); on = e && *e; if (on) { val = strtof(e, NULL); LOG("[vislog] DM_NVN_NANFIX=%g: a NaN at +0 of a structure naming the logged piece's draw unit is replaced (test)", (double)val); } }
+    if (on) *v = val; return on;
+}
+static void vl_ref_dump(uint64_t u, uint64_t r, const char *why, unsigned long long frame) {
+    uint64_t x[8]; if (!vl_rd(r, x, sizeof x)) { LOG("[vislog] %s frame %llu:   structure %#llx no longer readable", why, frame, (unsigned long long)r); return; }
+    float f0; memcpy(&f0, x, 4); uint32_t w0 = (uint32_t)x[0]; float fix;
+    char line[400]; int q = snprintf(line, sizeof line, "[vislog] %s frame %llu:   structure %#llx (+0x10 %s the unit):", why, frame, (unsigned long long)r, x[2] == u ? "names" : "no longer names");
+    for (int k = 0; k < 8; k++) q += snprintf(line + q, sizeof line - q, " %016llx", (unsigned long long)x[k]);
+    snprintf(line + q, sizeof line - q, " (+0 as a float %g)", (double)f0); LOG("%s", line);
+    if (x[2] == u && w0 == 0x7fc00000u && vl_nanfix(&fix)) {
+        dm_guest_write_prepare((void *)(uintptr_t)r, 4); memcpy((void *)(uintptr_t)r, &fix, 4);
+        if (atomic_fetch_add(&g_vl_nanfix_logs, 1) < 16) LOG("[vislog] %s frame %llu: DM_NVN_NANFIX wrote %g over the NaN at %#llx", why, frame, (double)fix, (unsigned long long)r);
+    }
+}
+int dm_vislog_units_dump(const char *why, unsigned long long frame) {   // returns the units known
+    if (vislog_want() <= 0) return 0;
+    pthread_mutex_lock(&g_vl_mu); uint64_t obj = g_vl_nent ? g_vl_ent[0].obj : 0, f0 = g_vl_ent_frame; pthread_mutex_unlock(&g_vl_mu);
+    if (!obj) return 0;
+    if ((g_vl_nunit < 0 || (g_vl_nunit == 0 && frame - g_vl_last_scan >= 900)) && why[0] != 's' && frame >= f0 + vl_scan_delay()) {
+        uint64_t all[64], t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int na = vl_scan_all(obj, g_vl_lo, g_vl_hi, all, 64); g_vl_nunit = 0; g_vl_last_scan = frame;
+        for (int i = 0; i < na && g_vl_nunit < VL_UNITS; i++) {
+            if (all[i] < 0x68 || vl_unit_dump(all[i] - 0x68, why, frame) < 0) continue;
+            uint64_t u = all[i] - 0x68, el[32]; int ne = vl_scan_all(u, g_vl_lo, g_vl_hi, el, 32), k = g_vl_nunit++;
+            g_vl_unit[k].u = u; g_vl_unit[k].nref = 0;
+            for (int e = 0; e < ne && g_vl_unit[k].nref < VL_REFS; e++) if (el[e] >= 0x10) g_vl_unit[k].ref[g_vl_unit[k].nref++] = el[e] - 0x10;
+        }
+        LOG("[vislog] %s frame %llu: %d words pointing at object %#llx in the guest range, %d draw units kept with their structures (%.0f ms)", why, frame, na, (unsigned long long)obj, g_vl_nunit,
+            (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6);
+    }
+    for (int k = 0; k < (g_vl_nunit > 0 ? g_vl_nunit : 0); k++) {
+        if (!(frame % 600)) vl_unit_dump(g_vl_unit[k].u, why, frame);
+        for (int e = 0; e < g_vl_unit[k].nref; e++) vl_ref_dump(g_vl_unit[k].u, g_vl_unit[k].ref[e], why, frame);
+    }
+    return g_vl_nunit > 0 ? g_vl_nunit : 0;
+}
+int dm_vislog_entries_dump(const char *why, unsigned long long frame) {   // returns the entries read
+    if (vislog_want() <= 0) return 0;
+    vl_ent e[VL_ENTS]; pthread_mutex_lock(&g_vl_mu); int n = g_vl_nent; memcpy(e, g_vl_ent, sizeof e); pthread_mutex_unlock(&g_vl_mu);
+    int nread = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t arr = 0, h = 0; uint8_t cnt[4] = {0}, ent[0x60]; uint32_t cmd = 0, ctl = 0;
+        if (!vl_rd(e[i].obj + VL_ENT_ARRAY, &arr, 8) || !vl_rd(e[i].obj + VL_ENT_COUNT, cnt, 4) || !vl_rd(arr + e[i].idx * VL_ENT_SIZE, ent, sizeof ent)) {
+            LOG("[vislog] %s frame %llu: entry %llu of object %#llx (recording %u) not readable", why, frame, (unsigned long long)e[i].idx, (unsigned long long)e[i].obj, e[i].rec_id); continue; }
+        memcpy(&h, ent + 0x50, 8); memcpy(&cmd, ent + 0x2c, 4); memcpy(&ctl, ent + 0x4c, 4); nread++;
+        LOG("[vislog] %s frame %llu: entry %llu of object %#llx (recording %u): handle %#llx, flags %#x (ready %d), command memory used %u, control memory used %u; object: %u entries, bytes +0x69d..+0x69f %u %u %u",
+            why, frame, (unsigned long long)e[i].idx, (unsigned long long)e[i].obj, e[i].rec_id, (unsigned long long)h, ent[0x58], ent[0x58] & 1, cmd, ctl, cnt[0], cnt[1], cnt[2], cnt[3]);
+    }
+    return nread;
+}
+// The command buffer that last ended a recording holding a draw of the logged size: what GetCommandMemoryUsed / GetControlMemoryUsed tell the game right after
+static void vl_used(const void *cb, const char *what, size_t v, void *ra) {
+    if (vislog_want() <= 0 || !cb || cb != g_vl_end_cb || atomic_fetch_add(&g_vl_used_logs, 1) >= 24) return;
+    const cmd_t *o = (const cmd_t *)cb; char w[64]; vl_pc_name(w, sizeof w, (uint64_t)(uintptr_t)ra);
+    LOG("[vislog] %s memory used read as %zu after a recording holding a draw of %d indices (command buffer %p, called from %s; begin %p, used %llu, command memory %llu, control memory %u of which %u used)",
+        what, v, vislog_want(), cb, w, (const void *)o->begin, (unsigned long long)o->used, (unsigned long long)o->cmd_size, o->ctl_size, o->ctl_used);
+}
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     if (o->recording) LOG("[RED] BeginRecording re-entered");
     o->recording = 2;   // 2: recording, no command yet (cmd_alloc sets begin)
     o->rec_id = atomic_fetch_add_explicit(&g_rec_serial, 1, memory_order_relaxed) + 1;
+    vl_begin(o, c);
     o->chunk = NULL; o->ctl_list = NULL; o->ctl_q[0] = o->ctl_q[1] = 0; o->own_back = 0;
 }
 // The recording's last entry carries CTL_LAST; an empty recording's list is one empty piece. The handle is the list's first entry
@@ -1271,6 +1464,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     if (!o->ctl_q[0]) o->ctl_q[0] = ctl_e(CTL_CHUNK, NULL, 0);
     ctl_flush(o); ctl_put(o, o->ctl_q[0] | CTL_LAST); o->ctl_q[0] = 0;
     uint8_t *h = o->ctl_list; o->ctl_list = NULL; o->recording = 0;
+    vl_end(o, c, (uint64_t)(uintptr_t)h);
     return (NVNcommandHandle)h;
 }
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
@@ -1309,9 +1503,71 @@ static int nvn_piece_record(const void *list, uint64_t v, const uint8_t *p, cons
 }
 // CallCommands: the called recording's pieces join the caller's list (its records run in place at submit: what its command memory holds then, nvn_piece_record; its control
 // memory may be given out again at once). It takes no command memory
+// The game's call chain at an NVN entry: the call site (the thunk is a tail jump, so the return address is in the game) and the frame-pointer chain above it; returns the frames
+// A frame record {x29, x30} at f: read directly inside this thread's stack (CallCommands runs thousands of times a frame), else through vm_read, which fails instead of faulting
+static int vl_rd16(uint64_t f, uint64_t rec[2]) {
+    static __thread uint64_t lo, hi;
+    if (!hi) { pthread_t t = pthread_self(); hi = (uint64_t)(uintptr_t)pthread_get_stackaddr_np(t); lo = hi - (uint64_t)pthread_get_stacksize_np(t); }
+    if (f >= lo && f <= hi - 16) { memcpy(rec, (const void *)(uintptr_t)f, 16); return 1; }
+    vm_size_t got = 0; return !vm_read_overwrite(mach_task_self(), (vm_address_t)f, 16, (vm_address_t)rec, &got) && got == 16;
+}
+static int vl_bt(void *ra, void *fp, uint64_t *pcs, int max) {
+    int d = 0; if (max <= 0) return 0; pcs[d++] = (uint64_t)ra;
+    if (!fp) return d;
+    uint64_t f = *(const uint64_t *)fp, rec[2];   // this function's own frame record: its saved x29 is the game's frame (tail-jump thunk)
+    while (d < max && f && !(f & 15) && vl_rd16(f, rec)) { pcs[d++] = rec[1]; if (rec[0] <= f) break; f = rec[0]; }
+    return d;
+}
+static int vl_pc_name(char *out, size_t n, uint64_t pc) {
+    module_t *m = module_of((void *)pc);
+    return m ? snprintf(out, n, "%s+%#llx", m->name, (unsigned long long)(pc - (uint64_t)m->base)) : snprintf(out, n, "%#llx", (unsigned long long)pc);
+}
+// DM_NVN_VISLOG: CallCommands / CopyCommands counted by the game's call chain (3 frames), with how many of those calls were of a handle holding a draw of the logged size; listed and
+// reset by dm_vislog_sites_dump (each 600 frames and at suspend), so the chain that calls a mod's piece on a launch where it shows can be compared with one where it does not
+enum { VL_SITES = 512, VL_DEPTH = 3 };
+static struct { uint64_t pc[VL_DEPTH]; uint64_t n, marked; } g_vl_site[VL_SITES]; static uint64_t g_vl_site_lost;
+static void vl_site_add(const uint64_t *pcs, int d, int marked) {
+    uint64_t k[VL_DEPTH] = {0}; for (int i = 0; i < d && i < VL_DEPTH; i++) k[i] = pcs[i];
+    unsigned h = (unsigned)(((k[0] ^ k[1] * 31 ^ k[2] * 131) * 0x9E3779B97F4A7C15ull) >> 55) & (VL_SITES - 1);
+    pthread_mutex_lock(&g_vl_mu);
+    for (int t = 0; t < VL_SITES; t++, h = (h + 1) & (VL_SITES - 1)) {
+        if (!g_vl_site[h].n) { memcpy(g_vl_site[h].pc, k, sizeof k); g_vl_site[h].n = 1; g_vl_site[h].marked = (uint64_t)marked; break; }
+        if (!memcmp(g_vl_site[h].pc, k, sizeof k)) { g_vl_site[h].n++; g_vl_site[h].marked += (uint64_t)marked; break; }
+        if (t == VL_SITES - 1) g_vl_site_lost++;
+    }
+    pthread_mutex_unlock(&g_vl_mu);
+}
+static int vl_site_cmp(const void *a, const void *b) { uint64_t x = ((const uint64_t *)a)[VL_DEPTH], y = ((const uint64_t *)b)[VL_DEPTH]; return x < y ? 1 : x > y ? -1 : 0; }
+void dm_vislog_sites_dump(const char *why, unsigned long long frame) {
+    if (vislog_want() <= 0) return;
+    static uint64_t v[VL_SITES][VL_DEPTH + 2]; int m = 0; uint64_t lost;
+    pthread_mutex_lock(&g_vl_mu);
+    for (int i = 0; i < VL_SITES; i++) if (g_vl_site[i].n) { memcpy(v[m], g_vl_site[i].pc, sizeof g_vl_site[i].pc); v[m][VL_DEPTH] = g_vl_site[i].n; v[m][VL_DEPTH + 1] = g_vl_site[i].marked; m++; }
+    memset(g_vl_site, 0, sizeof g_vl_site); lost = g_vl_site_lost; g_vl_site_lost = 0;
+    pthread_mutex_unlock(&g_vl_mu);
+    qsort(v, m, sizeof v[0], vl_site_cmp);
+    LOG("[sites] %s frame %llu: %d call chains of CallCommands / CopyCommands since the last list (%llu lost)", why, frame, m, (unsigned long long)lost);
+    for (int i = 0; i < m && i < 60; i++) {
+        char line[400]; int q = 0; for (int k = 0; k < VL_DEPTH && v[i][k]; k++) { q += snprintf(line + q, sizeof line - q, k ? " < " : ""); q += vl_pc_name(line + q, sizeof line - q, v[i][k]); }
+        LOG("[sites]   %s: %llu calls, %llu of a handle holding a draw of %d indices", line, (unsigned long long)v[i][VL_DEPTH], (unsigned long long)v[i][VL_DEPTH + 1], vislog_want());
+    }
+}
+static void vl_called(const cmd_t *o, const void *cb, int n, const NVNcommandHandle *h, const char *how, void *ra, void *fp) {
+    if (vislog_want() <= 0) return;
+    uint64_t pcs[8]; int d = vl_bt(ra, fp, pcs, 8), marked = 0;
+    for (int i = 0; i < n; i++) if (vl_handle(h[i], NULL)) marked++;
+    vl_site_add(pcs, d, marked);
+    if (marked) { static _Atomic unsigned nbt; if (atomic_fetch_add(&nbt, 1) < 6) {
+        char line[900]; int q = snprintf(line, sizeof line, "[vislog] %s a handle holding a draw of %d indices from", how, vislog_want());
+        for (int k = 0; k < d && q < (int)sizeof line - 60; k++) { q += snprintf(line + q, sizeof line - q, " "); q += vl_pc_name(line + q, sizeof line - q, pcs[k]); }
+        LOG("%s", line); } }
+    for (int i = 0; i < n; i++) { uint32_t id = 0, m = vl_handle(h[i], &id); if (!m) continue; vl_mark(o, cb, m);
+        static _Atomic unsigned nlog; if (atomic_fetch_add(&nlog, 1) < 12) LOG("[vislog] handle %#llx (recording %u, %u draws of %d indices) %s into recording %u of command buffer %p at frame %llu", (unsigned long long)h[i], id, m, vislog_want(), how, o->rec_id, cb, (unsigned long long)dm_nvn_frame_count()); }
+}
 NVN(nvnCommandBufferCallCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
     cmd_t *o = CB(c);
     if (!o->recording) { LOG("[RED] CallCommands outside a recording"); return; }
+    vl_called(o, c, n, h, "called", __builtin_return_address(0), __builtin_frame_address(0));
     for (int i = 0; i < n; i++) {
         if (!ctl_handle_ok(h[i])) continue;
         ctl_chunk_close(o);
@@ -1323,6 +1579,7 @@ NVN(nvnCommandBufferCallCommands, void, NVNcommandBuffer *c, int n, const NVNcom
 NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
     cmd_t *o = CB(c);
     if (!o->recording) { LOG("[RED] CopyCommands outside a recording"); return; }
+    vl_called(o, c, n, h, "copied", __builtin_return_address(0), __builtin_frame_address(0));
     for (int i = 0; i < n; i++) {
         if (!ctl_handle_ok(h[i])) continue;
         ctl_iter it = { (const uint8_t *)(uintptr_t)h[i], 0 }; uint64_t v; op_hdr r;
@@ -1382,6 +1639,7 @@ NVN(nvnCommandBufferResetCounter, void, NVNcommandBuffer *c, NVNcounterType t) {
 }
 NVN(nvnCommandBufferReportCounter, void, NVNcommandBuffer *c, NVNcounterType t, NVNbufferAddress a) {
     uint8_t *p = cmd_alloc(CB(c), 24); put_hdr(p, OP_REPORT_COUNTER, 24); uint64_t tt = t; memcpy(p + 8, &tt, 8); memcpy(p + 16, &a, 8);
+    if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) mtl_vis_report_recorded((uint64_t)a);   // on the game's thread, before it can read the record (DM_NVN_VIS_PROVISIONAL)
 }
 NVN(nvnCommandBufferCopyBufferToBuffer, void, NVNcommandBuffer *c, NVNbufferAddress src, NVNbufferAddress dst, size_t n, int flags) {
     (void)flags;
@@ -1734,8 +1992,28 @@ NVN_NOPROTO(nvnCommandBufferBindShadingRateImage, void, NVNcommandBuffer *c, con
 NVN_NOPROTO(nvnCommandBufferShadingRateImagePalette, void, NVNcommandBuffer *c, int first, int n, const void *entries) { (void)c; (void)first; (void)n; (void)entries; }
 NVN_NOPROTO(nvnCommandBufferSetShadingRatePaletteMode, void, NVNcommandBuffer *c, int mode) { (void)c; (void)mode; }
 NVN(nvnCommandBufferDrawArraysIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNbufferAddress ind) { rec_draw(c, (p_draw){pr, 0, 0, 1, 0, ind}); }
+// DM_NVN_VISLOG=<index count> (diagnostic, kid-with-sword-remake L7.9): indexed draws of that size counted as the game records them (the replay counts them again in nvn_mtl.m,
+// so a draw lost between the two shows), the first three logged with the game's call site and the frame-pointer chain above it (the thunk is a tail jump: the return address is
+// the call site in the game), to find the code that decides whether a mod's piece (the Goku mod's body) is drawn
+static void vislog_rec(NVNcommandBuffer *c, int n, void *ra, void *fp) {
+    int want = vislog_want(); if (want <= 0 || n != want) return;
+    const cmd_t *o = CB(c); vl_mark(o, c, 1); vl_entry_note(fp, o->rec_id);
+    uint64_t k = atomic_fetch_add(&dm_vislog_recorded, 1) + 1; if (k > 12) return;
+    char sl[1200]; int q = snprintf(sl, sizeof sl, "[vislog] recorded draw %llu of %d indices into recording %u of command buffer %p (%s) at frame %llu, called from", (unsigned long long)k, n, o->rec_id, (void *)c,
+                                    o->recording ? "recording" : "NOT RECORDING", (unsigned long long)dm_nvn_frame_count());
+    uint64_t pc = (uint64_t)ra, f = 0; vm_size_t got = 0;
+    if (fp && !vm_read_overwrite(mach_task_self(), (vm_address_t)fp, 8, (vm_address_t)&f, &got) && got == 8) {}   // this function's saved x29: the game's frame (tail-jump thunk)
+    for (int d = 0; d < 12 && q < (int)sizeof sl - 60; d++) {
+        module_t *m = module_of((void *)pc);
+        q += m ? snprintf(sl + q, sizeof sl - q, " %s+%#llx", m->name, (unsigned long long)(pc - (uint64_t)m->base)) : snprintf(sl + q, sizeof sl - q, " %#llx", (unsigned long long)pc);
+        uint64_t rec[2]; if (!f || (f & 15) || vm_read_overwrite(mach_task_self(), (vm_address_t)f, 16, (vm_address_t)rec, &got) || got != 16) break;
+        pc = rec[1]; if (rec[0] <= f) break; f = rec[0];
+    }
+    LOG("%s", sl);
+}
 NVN(nvnCommandBufferDrawElementsInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib,
     int bv, int bi, int inst) {
+    vislog_rec(c, n, __builtin_return_address(0), __builtin_frame_address(0));
     rec_draw_idx(c, (p_draw_idx){pr, it, n, bv, bi, inst, ib});
 }
 NVN(nvnCommandBufferDispatchCompute, void, NVNcommandBuffer *c, int x, int y, int z) {
@@ -3386,6 +3664,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
     prev_in = t0; prev_pass = ps; prev_draw = dr;
     dump_frame();
+    nvn_dirty_frame();   // write-pending pages count whole frames (nvn_dirty.c, T-141)
     { void dm_vi_frame_queued(uint64_t); dm_vi_frame_queued(g_frame); }   // the layer's frame history (hle_vi.c), numbered as GetLatestFrameNumber
     if (g_frame % TWIN == 0) tsummary(g_frame);
     // GPU replay carries the submitted frame, even when a later CPU frame is already queued.
@@ -3450,6 +3729,7 @@ NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *buf, const NVNbufferBuilder *b) 
     if ((uint64_t)bb->off + bb->size > bb->pool->size) ONCE_LOG("BufferInitialize: a buffer reaches past the end of its pool (offset %#llx size %#llx pool %#llx); only an access that leaves the pool is an error, and it is reported where it happens", (unsigned long long)bb->off, (unsigned long long)bb->size, (unsigned long long)bb->pool->size);
     *(buf_t *)buf = (buf_t){.magic = MAGIC('B', 'U', 'F', 0), .pool = bb->pool, .off = bb->off, .size = bb->size};
     pool_mark_addressed(bb->pool);
+    if (!(bb->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | 0x200)) && (uint64_t)bb->off < bb->pool->size) { uint64_t n = bb->size; if (n > bb->pool->size - (uint64_t)bb->off) n = bb->pool->size - (uint64_t)bb->off; mtl_preread(bb->pool->mem + bb->off, n); }   // DM_NVN_PREREAD
     OLOG("BufferInitialize %p pool=%p off=%#llx size=%#llx", (void *)buf, (const void *)bb->pool, (unsigned long long)bb->off, (unsigned long long)bb->size);
     return 1;
 }
@@ -4163,10 +4443,10 @@ NVN_NOPROTO(nvnWindowGetNumActiveTextures, int, const NVNwindow *w) { return win
 // command buffer and records every frame into it; its memory callback (main+0x9ca960) takes chunk start + used as the position the GPU has reached and frees the ring up to there when the frame's fence
 // signals. Counted per recording, the position stayed at one frame's size (about 18 KB), the ring never freed past it, and after the first 16 MB (about 15 s) the callback waited for ring space forever
 NVN(nvnCommandBufferGetCommandMemoryUsed, size_t, const NVNcommandBuffer *c) { const cmd_t *m = (const cmd_t *)c;
-    return m->begin ? (size_t)m->used : 0; }
+    size_t v = m->begin ? (size_t)m->used : 0; vl_used(c, "command", v, __builtin_return_address(0)); return v; }
 // Control memory: the entries written into the last block, and those still waiting to be written (ctl_q)
 static size_t ctl_used_now(const cmd_t *o) { size_t u = o->ctl_used + 8u * (size_t)(!!o->ctl_q[0] + !!o->ctl_q[1]); return u < o->ctl_size ? u : o->ctl_size; }
-NVN(nvnCommandBufferGetControlMemoryUsed, size_t, const NVNcommandBuffer *c) { return ctl_used_now((const cmd_t *)c); }
+NVN(nvnCommandBufferGetControlMemoryUsed, size_t, const NVNcommandBuffer *c) { size_t v = ctl_used_now((const cmd_t *)c); vl_used(c, "control", v, __builtin_return_address(0)); return v; }
 NVN(nvnCommandBufferGetControlMemoryFree, size_t, const NVNcommandBuffer *c) { const cmd_t *o = (const cmd_t *)c; return o->ctl_size - ctl_used_now(o); }
 NVN(nvnCommandBufferGetControlMemorySize, size_t, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->ctl_size; }
 // Free bytes of the command memory (DRAGON QUEST XI S, Unreal Engine 4.18): what is left in the current segment
@@ -4449,8 +4729,8 @@ NVN(nvnCommandBufferBindImage, void, NVNcommandBuffer *c, NVNshaderStage st, int
 NVN(nvnCommandBufferBindVertexBuffer, void, NVNcommandBuffer *c, int i, NVNbufferAddress a, size_t n) { NVNbufferRange r = {a, n}; h_nvnCommandBufferBindVertexBuffers(c, i, 1, &r); }
 
 // Draws
-NVN(nvnCommandBufferDrawElements, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib) { h_nvnCommandBufferDrawElementsInstanced(c, pr, it, n, ib, 0, 0, 1); }
-NVN(nvnCommandBufferDrawElementsBaseVertex, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib, int bv) { h_nvnCommandBufferDrawElementsInstanced(c, pr, it, n, ib, bv, 0, 1); }
+NVN(nvnCommandBufferDrawElements, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib) { vislog_rec(c, n, __builtin_return_address(0), __builtin_frame_address(0)); rec_draw_idx(c, (p_draw_idx){pr, it, n, 0, 0, 1, ib}); }
+NVN(nvnCommandBufferDrawElementsBaseVertex, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib, int bv) { vislog_rec(c, n, __builtin_return_address(0), __builtin_frame_address(0)); rec_draw_idx(c, (p_draw_idx){pr, it, n, bv, 0, 1, ib}); }
 NVN(nvnCommandBufferDrawArraysInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n, int bi, int inst) {
     rec_draw(c, (p_draw){pr, first, n, inst, bi});
 }
