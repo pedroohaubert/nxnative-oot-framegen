@@ -18,6 +18,7 @@
 #include <sys/clonefile.h>
 #include <sys/xattr.h>
 #include "romfs_image.h"
+#include "mods.h"
 #include "save_sync.h"
 
 #define RES_PATH_NOT_FOUND 0x202u      // fs module 2, description 1
@@ -51,15 +52,15 @@ typedef struct {
     char name[32]; char dir[1024]; char overlay[4096]; char commit[1024];
     romfs_img *img;                  // non-NULL: dir is a RomFS image file
     int ro;
-    int aoc;                         // add-on content: Unmount releases the name (mount_aoc)
-    int released;                    // an add-on content entry after its Unmount: kept for open handles and a later mount of its image, matched by no name (mnt_is)
+    int releasable;                  // add-on content and cache storage: Unmount releases the name (mount_releasable)
+    int released;                    // a releasable entry after its Unmount: kept for open handles and a later mount of its target, matched by no name (mnt_is)
     int txn_root;                    // canonical mount entry for this backing transaction, or -1
     _Atomic int poison;              // failure state belongs to this backing, not to the process
     _Atomic uint64_t first_write_ns;
 } mount_t;
 static mount_t g_mnt[MAX_MOUNT];   // commit non-empty = transactional save mount
 static int g_nmnt;
-// Whether entry m is mounted under the n-byte name s; a released entry (aoc_release) is under none
+// Whether entry m is mounted under the n-byte name s; a released entry (host_unmount) is under none
 static int mnt_is(const mount_t *m, const char *s, size_t n) { return !m->released && strlen(m->name) == n && !strncmp(m->name, s, n); }
 static int mnt_named(const mount_t *m, const char *name) { return mnt_is(m, name, strlen(name)); }
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -166,15 +167,46 @@ static int rom_overlay_path(const mount_t *m, const char *rest, char *out, size_
 // DM_ROMFS_OVERLAY's folders, each preceded by its amiibo-nolimit/ subfolder where it has one: Ocarina of Time's Game/AmiiboSetting with every amiibo's daily limit off and the
 // resource size table entry it needs (scripts/oot_amiibo_overlay.py, which build_ipa.sh runs on the player's own RomFS image into the app's romfs_overlay). Only that subfolder: the
 // X line's per-mode resolution folders (handheld/, docked/, potato-*) are never served on this line, whose render scale is a patch (patches.py)
+// A folder that does not fit in dst is left out whole (and said so), never cut short into another path: mods.h mods_prepare keeps the list within the field
+static void rom_overlay_add(char *dst, size_t n, const char *root) {
+    if (strlen(dst) + !!dst[0] + strlen(root) >= n) { LOG("[RED] fs rom overlay: no room for %s; not served", root); return; }
+    if (dst[0]) strlcat(dst, ":", n);
+    strlcat(dst, root, n);
+}
 static void rom_overlay_expand(const char *env, char *dst, size_t n) {
     dst[0] = 0; char *roots = strdup(env); if (!roots) die("rom overlay allocation failed");
     char *save = NULL;
     for (char *root = strtok_r(roots, ":", &save); root; root = strtok_r(NULL, ":", &save)) {
         char sub[1100]; struct stat st; snprintf(sub, sizeof sub, "%s/amiibo-nolimit", root);
-        if (!stat(sub, &st) && S_ISDIR(st.st_mode)) { if (dst[0]) strlcat(dst, ":", n); strlcat(dst, sub, n); LOG("fs rom overlay: %s (amiibo: daily limit off)", sub); }
-        if (dst[0]) strlcat(dst, ":", n); strlcat(dst, root, n);
+        if (!stat(sub, &st) && S_ISDIR(st.st_mode)) { rom_overlay_add(dst, n, sub); LOG("fs rom overlay: %s (amiibo: daily limit off)", sub); }
+        rom_overlay_add(dst, n, root);
     }
     free(roots);
+}
+// The rom mount's overlay folders: DM_ROMFS_OVERLAY (the app's own replacements), with the player's enabled mods (DM_MODS) and their merged size table over it (mods.h).
+// Without DM_MODS it is DM_ROMFS_OVERLAY itself, as it always was. With it, the list is worked out at the first rom mount and again only when either variable changes. NULL: no overlay
+static _Atomic int g_mods_served = -1;   // the player's mods with files served (-1: DM_MODS set but not worked out yet, at the first rom mount)
+int dm_mods_active(void) { const char *m = getenv("DM_MODS"); return m && *m ? atomic_load(&g_mods_served) : 0; }   // hle_hid.c dm_input_startup_hold_left
+static const char *rom_overlay_env(void) {
+    const char *bundled = getenv("DM_ROMFS_OVERLAY"), *mods = getenv("DM_MODS");
+    if (!mods || !*mods) return bundled;
+    static char list[sizeof g_mnt[0].overlay], key[2 * sizeof g_mnt[0].overlay]; static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    char now[sizeof key]; snprintf(now, sizeof now, "%s\n%s", mods, bundled ? bundled : "");
+    pthread_mutex_lock(&lock);
+    if (strcmp(key, now)) {
+        strlcpy(key, now, sizeof key);
+        char b[1024]; const char *work = getenv("DM_MODS_WORK");
+        mods_stat st[MODS_MAX]; int n = mods_prepare(mods, bundled, envdir("DM_ROMFS", "romfs", b, sizeof b), getenv("DM_MODS_RSTB"), work && *work ? work : NULL, list, sizeof list, st, MODS_MAX);
+        char *all = strdup(mods), *save = NULL; int i = 0;
+        for (char *r = all ? strtok_r(all, ":", &save) : NULL; r && i < MODS_MAX; r = strtok_r(NULL, ":", &save), i++)
+            LOG("fs mod %d: %s: %d files%s, %d bigger than the originals, %d size table entries raised%s%s%s%s", i + 1, r, st[i].files, st[i].shadowed ? " (some under a mod above)" : "", st[i].bigger, st[i].raised,
+                st[i].untracked ? " [RED] some bigger files have no size table room" : "", st[i].own_table ? ", its own size table not served" : "", st[i].dropped ? " [RED] not served" : "", st[i].no_table && st[i].bigger ? " (no size table in this app)" : "");
+        free(all);
+        { int served = 0; for (int j = 0; j < i && j < MODS_MAX; j++) served += st[j].files > 0 && !st[j].dropped; atomic_store(&g_mods_served, served); }
+        LOG("fs rom overlay with %d mod%s: %s", n, n == 1 ? "" : "s", list);
+    }
+    pthread_mutex_unlock(&lock);
+    return list[0] ? list : NULL;
 }
 // A path on an image mount: returns 1 with the mount in *mi and the entry in *k (-1 with errno set when there is none); 0 for a path on any other mount, or one an overlay folder (DM_ROMFS_OVERLAY) has, which then opens as a host file
 static int img_path(const char *p, int *mi, int64_t *k) {
@@ -191,24 +223,37 @@ static int img_path(const char *p, int *mi, int64_t *k) {
     return 0;
 }
 static void save_old_names(const char *from, const char *to);
-static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
+static Result mount_impl(const char *name, const char *dir, int ro, int txn, int releasable) {
     pthread_once(&g_txn_lock_once, txn_locks_init);
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < g_nmnt; i++)
+    int back = -1;
+    for (int i = 0; i < g_nmnt; i++) {
         if (mnt_named(&g_mnt[i], name)) {
-            // Repeating the same mount is harmless, but a different account's
-            // save under this name must not silently resolve to the old account.
+            // Repeating the same mount is harmless, but a different target
+            // under this name must not silently resolve to the old mount.
             const char *backing = g_mnt[i].commit[0] ? g_mnt[i].commit : g_mnt[i].dir;
             Result r = !strcmp(backing, dir) && g_mnt[i].ro == ro ? RES_OK : RES_PATH_EXISTS;
             pthread_mutex_unlock(&g_lock); return r;
         }
+        if (releasable && !txn && g_mnt[i].released && g_mnt[i].releasable &&
+            g_mnt[i].ro == ro && !g_mnt[i].commit[0] && !strcmp(g_mnt[i].dir, dir))
+            back = i;
+    }
+    if (back >= 0) {
+        strlcpy(g_mnt[back].name, name, sizeof g_mnt[0].name);
+        g_mnt[back].released = 0;
+        pthread_mutex_unlock(&g_lock);
+        if (!ro) mkdir(dir, 0755);
+        LOG("fs mount %s: → %s (%sthe entry it had before its unmount)", name, dir, ro ? "read-only, " : "");
+        return RES_OK;
+    }
     if (g_nmnt >= MAX_MOUNT) die("mount table full");
     strlcpy(g_mnt[g_nmnt].name, name, sizeof g_mnt[0].name);
-    g_mnt[g_nmnt].ro = ro; g_mnt[g_nmnt].aoc = 0; g_mnt[g_nmnt].released = 0; g_mnt[g_nmnt].overlay[0] = 0; g_mnt[g_nmnt].commit[0] = 0;
+    g_mnt[g_nmnt].ro = ro; g_mnt[g_nmnt].releasable = releasable; g_mnt[g_nmnt].released = 0; g_mnt[g_nmnt].overlay[0] = 0; g_mnt[g_nmnt].commit[0] = 0;
     g_mnt[g_nmnt].txn_root = -1;
     atomic_store(&g_mnt[g_nmnt].poison, 0);
     atomic_store(&g_mnt[g_nmnt].first_write_ns, 0);
-    const char *overlay = !strcmp(name, "rom") ? getenv("DM_ROMFS_OVERLAY") : NULL;
+    const char *overlay = !strcmp(name, "rom") ? rom_overlay_env() : NULL;
     if (overlay) rom_overlay_expand(overlay, g_mnt[g_nmnt].overlay, sizeof g_mnt[0].overlay);
     // The transaction directory cannot be set up (leftovers cannot be cleared / clone failed, which really happens on a full disk): do not exit; mount the committed directory read-only -- saves still read, every write fails, commits are no-ops, the committed version is untouched, and the front end is told
     // (each of these three failures used to call die: with the phone's storage full the game exited as soon as it mounted its saves)
@@ -251,48 +296,35 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     LOG("fs mount %s: → %s%s%s", name, txn ? g_mnt[g_nmnt - 1].dir : dir, ro || txn_err ? " (read-only)" : txn ? " (transactional save: work directory, swapped in atomically on Commit)" : "", g_mnt[g_nmnt - 1].overlay[0] ? " (overlay first)" : "");
     return RES_OK;
 }
-static Result mount(const char *name, const char *dir, int ro) { return mount_ex(name, dir, ro, 0); }
+static Result mount_ex(const char *name, const char *dir, int ro, int txn) { return mount_impl(name, dir, ro, txn, 0); }
+static Result mount(const char *name, const char *dir, int ro) { return mount_impl(name, dir, ro, 0, 0); }
 
-// Add-on content under a name the game gives back. On Horizon Unmount releases the name and the next mount under it gets the add-on it names: Pokémon Friends'
-// AocVersionCheker mounts each add-on as "AVCtitle", reads its AocVersion/AocVersion_<label>.json and unmounts it. The host's table keeps its entries, as an open
-// image file names its entry by index (IMG_HANDLE): Unmount marks an add-on's entry released (aoc_release; it keeps its name for the log, and no name lookup matches it, mnt_is), and a later mount of the same image takes that entry back,
-// so cycling through the add-ons does not grow the table. A name still in use keeps its target, as mount_ex does for every mount.
-static Result mount_aoc(const char *name, const char *dir) {
+// Add-on content and cache storage under a name the game gives back. On Horizon Unmount releases the name and the next mount under it gets the target it names: Pokémon Friends'
+// AocVersionCheker mounts each add-on as "AVCtitle", reads its AocVersion/AocVersion_<label>.json and unmounts it, and Taiko no Tatsujin: Rhythm Festival's plugin mounts cache
+// storage index 1, unmounts it, and mounts index 2 under the same name. The host's table keeps its entries, as an open image file names its entry by index (IMG_HANDLE): Unmount
+// marks a releasable entry released (host_unmount; it keeps its name for the log, and no name lookup matches it, mnt_is), and a later mount of the same target and mode takes that
+// entry back under the same lock, so cycling indices does not grow the table. A different target under a name still in use is refused with RES_PATH_EXISTS, as on Horizon.
+static Result mount_releasable(const char *name, const char *dir, int ro) { return mount_impl(name, dir, ro, 0, 1); }
+// Unmount of a host mount: returns 1 if the host owns the name (releasing it when releasable; the entry and any open image stay so handles left open still read),
+// 0 when the name is not in the host's table (so h_fs_Unmount may release an SDK-owned mount with no host lock held)
+static int host_unmount(const char *name) {
+    const char *released_dir = NULL;
+    int found = 0;
     {
         PATH_LOCK(); pthread_mutex_lock(&g_lock);
-        int back = -1;
-        for (int i = 0; i < g_nmnt; i++) {
-            if (mnt_named(&g_mnt[i], name)) { pthread_mutex_unlock(&g_lock); return RES_OK; }
-            if (g_mnt[i].released && !strcmp(g_mnt[i].dir, dir)) back = i;
-        }
-        if (back >= 0) {
-            strlcpy(g_mnt[back].name, name, sizeof g_mnt[0].name); g_mnt[back].released = 0;
-            pthread_mutex_unlock(&g_lock);
-            LOG("fs mount %s: → %s (read-only, the entry it had before its unmount)", name, dir);
-            return RES_OK;
-        }
+        for (int i = 0; i < g_nmnt; i++)
+            if (mnt_named(&g_mnt[i], name)) {
+                found = 1;
+                if (g_mnt[i].releasable) {
+                    g_mnt[i].released = 1;
+                    released_dir = g_mnt[i].dir;
+                }
+                break;
+            }
         pthread_mutex_unlock(&g_lock);
     }
-    Result r = mount(name, dir, 1);   // mount_ex logs it
-    if (r == RES_OK) {
-        PATH_LOCK(); pthread_mutex_lock(&g_lock);
-        for (int i = g_nmnt - 1; i >= 0; i--) if (mnt_named(&g_mnt[i], name)) { g_mnt[i].aoc = 1; break; }
-        pthread_mutex_unlock(&g_lock);
-    }
-    return r;
-}
-// Unmount of an add-on content mount: the name is released, the entry and its image stay (a handle left open still reads the image it opened). 1 if the name was one
-static int aoc_release(const char *name) {
-    PATH_LOCK(); pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < g_nmnt; i++)
-        if (g_mnt[i].aoc && mnt_named(&g_mnt[i], name)) {
-            g_mnt[i].released = 1;
-            pthread_mutex_unlock(&g_lock);
-            LOG("fs unmount %s: add-on content released (%s)", name, g_mnt[i].dir);
-            return 1;
-        }
-    pthread_mutex_unlock(&g_lock);
-    return 0;
+    if (released_dir) LOG("fs unmount %s: released (%s)", name, released_dir);
+    return found;
 }
 
 // APFS is case-insensitive by default, Horizon paths are case-sensitive: every component is looked up exactly by guest name.
@@ -562,7 +594,7 @@ HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", "fsp-srv; rom reads the host d
 HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv; rom → host RomFS directory", Result, h_fs_MountRom, const char *name, void *cache, size_t sz) { dm_thread_service_request();
     (void)cache; (void)sz; char b[1024];
     Result r = mount(name, envdir("DM_ROMFS", "romfs", b, sizeof b), 1);
-    const char *overlay = getenv("DM_ROMFS_OVERLAY");
+    const char *overlay = rom_overlay_env();
     if (r == RES_OK && overlay) {
         PATH_LOCK();
         for (int i = 0; i < g_nmnt; i++) if (mnt_named(&g_mnt[i], name)) {
@@ -627,7 +659,7 @@ HLE_FORCE("_ZN2nn2fs17MountAddOnContentEPKciPvm", "fsp-srv; add-on content → D
         LOG("fs mount add-on content %s: index %d does not exist (DM_AOC_DIR=%s)", name, index, getenv("DM_AOC_DIR") ? getenv("DM_AOC_DIR") : "unset");
         return RES_TARGET_NOT_FOUND;
     }
-    return mount_aoc(name, dir);
+    return mount_releasable(name, dir, 1);
 }
 // System data archives are firmware content, which the host does not ship. A player can supply their own console's: <DM_SYSTEM_DIR>/sysdata/<id as 16 hex digits>/ holds an archive's
 // RomFS files, mounted read-only. Without it, the two Mii model archives are the host's stand-in, one directory of files in their shared layout with every part blank (hle_mii.c
@@ -837,7 +869,7 @@ HLE_FORCE("_ZN2nn2fs18CreateCacheStorageEill", "fsp-srv; cache storage → host 
     cache_size_put(index, size, journal); return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs17MountCacheStorageEPKci", "fsp-srv; cache storage → host directory", Result, h_fs_MountCache, const char *name, int index) {
-    char b[1100]; cache_dir(index, b, sizeof b); mkdir(b, 0755); return mount(name, b, 0);
+    char b[1100]; cache_dir(index, b, sizeof b); mkdir(b, 0755); return mount_releasable(name, b, 0);
 }
 HLE_FORCE("_ZN2nn2fs18DeleteCacheStorageEi", "fsp-srv; cache storage → deletes the host directory", Result, h_fs_DeleteCache, int index) {
     char b[1100]; rm_tree(cache_dir(index, b, sizeof b)); unlink(cache_size_path(index, b, sizeof b)); return RES_OK;
@@ -855,17 +887,8 @@ HLE_FORCE("_ZN2nn2fs18GetSaveDataSizeMaxEPlS1_", "fsp-srv; largest save data siz
 // The application's control data (control.nacp: nn::ns::ApplicationControlProperty, 0x4000 bytes, little-endian), which Horizon serves the SDK from the installed title: DM_CONTROL_NACP, else
 // control.nacp beside the RomFS (the NSP script's extraction folder <version>/{RomFS,control.nacp}, the Mac app's Resources). 0 = len bytes read at off
 static int control_read(off_t off, void *out, size_t len) {
-    char p[1100], b[1024]; const char *e = getenv("DM_CONTROL_NACP");
-    if (e && *e) snprintf(p, sizeof p, "%s", e);
-    else {
-        snprintf(p, sizeof p, "%s", envdir("DM_ROMFS", "romfs", b, sizeof b));
-        size_t k = strlen(p); while (k > 1 && p[k - 1] == '/') p[--k] = 0;
-        char *sl = strrchr(p, '/'); if (sl) sl[1] = 0; else p[0] = 0;
-        strlcat(p, "control.nacp", sizeof p);
-    }
-    int fd = open(p, O_RDONLY); ssize_t r = fd < 0 ? -1 : pread(fd, out, len, off);
-    if (fd >= 0) close(fd);
-    if (r != (ssize_t)len) { LOG("[RED] control data: %s %s", p, fd < 0 ? "is missing" : "is too short"); return -1; }
+    char p[1100]; int r = dm_control_read(off, out, len, p, sizeof p);
+    if (r) { LOG("[RED] control data: %s %s", p, r == -1 ? "is missing" : "is too short"); return -1; }
     return 0;
 }
 // The cache storage limits the application declares: CacheStorageDataAndJournalSizeMax (s64 at 0x3180) and CacheStorageIndexMax (u16 at 0x3188). Without the SDK's service the call read a null
@@ -1077,14 +1100,13 @@ out:
 HLE_FORCE("_ZN2nn2fs6CommitEPKcRKNS0_12CommitOptionE", "fsp-srv; same as Commit (the option only clears the restore flag)", Result, h_fs_CommitOpt, const char *name, const void *opt) { (void)opt; return h_fs_Commit(name); }
 // SDK 11's old name: CommitSaveData(mount name) is the later Commit (Metroid Dread)
 HLE_FORCE("_ZN2nn2fs14CommitSaveDataEPKc", "fsp-srv; same as Commit (SDK 11's old name)", Result, h_fs_CommitSaveData, const char *name) { return h_fs_Commit(name); }
-// The host's mount table is permanent, so unmounting one of its names changes nothing, except an add-on content mount's, whose name is released (aoc_release, mount_aoc:
-// a game may mount the next add-on under it). A mount call the host does not take over runs in the SDK and registers in the SDK's own table
+// The host's mount table is permanent, so unmounting one of its names changes nothing, except an add-on content or cache storage mount's, whose name is released (host_unmount,
+// mount_releasable: a game may mount the next add-on or cache storage index under it). A mount call the host does not take over runs in the SDK and registers in the SDK's own table
 // (nn::fs::MountRamDisk), and only the SDK can release it. Paper Mario: The Thousand-Year Door unmounts its "cache" RAM disk, frees the buffer and mounts it again, which with the entry left
 // behind failed with MountNameAlreadyExists and aborted (main+0x303b74, GitHub issue #1012). The SDK's Unmount aborts on a name it does not hold, hence its IsMounted first; a name in
 // neither table stays a no-op. No host lock is held across the SDK's calls, which take the SDK's own locks and free guest memory
-HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; host mounts are permanent, a no-op, but an add-on content mount releases its name; a mount in the SDK's own table (RAM disk) is released there", void, h_fs_Unmount, const char *name) {
-    if (!name) return;
-    if (host_mounted(name)) { aoc_release(name); return; }
+HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; host mounts are permanent, a no-op, but an add-on content or cache storage mount releases its name; a mount in the SDK's own table (RAM disk) is released there", void, h_fs_Unmount, const char *name) {
+    if (!name || host_unmount(name)) return;
     int (*sdk_is_mounted)(const char *) = guest_sym("_ZN2nn2fs9IsMountedEPKc");
     void (*sdk_unmount)(const char *) = guest_sym("_ZN2nn2fs7UnmountEPKc");
     if (!sdk_is_mounted || !sdk_unmount || !sdk_is_mounted(name)) return;

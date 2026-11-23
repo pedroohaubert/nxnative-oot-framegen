@@ -14,6 +14,7 @@ private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryK
 /// Cloud saves too). The host brings the save in from there when the game starts and
 /// sends it there after each save (dm/host/save_sync.h); the folder is a bookmark (CloudSaves.m).
 struct CloudSavesSection: View {
+    var checking: Bool = false
     @State private var folder: String = ""
     @State private var note: String = ""
     @State private var picking = false
@@ -27,6 +28,7 @@ struct CloudSavesSection: View {
                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
             Button(folder.isEmpty ? "Choose a folder in iCloud Drive…" : "Choose a different folder…") { picking = true }
+                .disabled(checking)
                 // The sheet sits on the button, not on the Section: SwiftUI hands a Section's modifiers to every row, so one tap presented a picker per row and they invalidated each other (LNPANDY/NX2Apple#315).
                 .sheet(isPresented: $picking) {
                     DocumentPicker(types: [.folder]) { url in
@@ -43,6 +45,7 @@ struct CloudSavesSection: View {
                 Button("Turn off cloud saves", role: .destructive) {
                     dm_clear_cloud_saves(); refresh(); note = ""
                 }
+                .disabled(checking)
             }
         } footer: {
             Text(note.isEmpty
@@ -56,7 +59,7 @@ struct CloudSavesSection: View {
         var stale: ObjCBool = false
         folder = dm_cloud_saves_path(&stale) ?? ""
         if stale.boolValue && folder.isEmpty {
-            note = "The folder you chose before is no longer readable (the app was signed differently). Please choose it again."
+            note = "The folder you chose before is no longer readable. Please choose it again."
         }
     }
 }
@@ -101,6 +104,8 @@ private struct LauncherView: View {
     @State private var report: SaveSyncReport?
     @State private var asking: SaveSyncReport.Step?
     @State private var drawer = false
+    @State private var modsDrawer = false
+    @ObservedObject private var mods = ModStore.shared   // the Mods button's count and panel (Mods.swift)
     @State private var background = LauncherBackgroundStore.image()
     @State private var statusLine = ""
     // The quick tiles, in one row: the frame limit (a choice, stepped through by taps), then the toggles players change most (the drawer has them too); a game without one shows the rest.
@@ -134,6 +139,12 @@ private struct LauncherView: View {
             Button("Try Again") { DispatchQueue.main.async { start() } }
             Button("Cancel", role: .cancel) {}
         } message: { r in Text(r.unreadableMessage(here: "iPhone")) }
+        .confirmationDialog(SaveSyncReport.missingTitle, isPresented: isAsking(.missing), titleVisibility: .visible, presenting: report) { r in
+            Button("Try Again") { DispatchQueue.main.async { start() } }
+            Button("Play Without Sending") { go("offline") }   // this iPhone's save, not sent: the next start compares again
+            Button(r.sendLabel(here: "iPhone"), role: .destructive) { go(r.localChoice) }   // local:none
+            Button("Cancel", role: .cancel) {}
+        } message: { r in Text(r.missingMessage(here: "iPhone")) }
         .task {
             var stale: ObjCBool = false
             let cloud = (dm_cloud_saves_path(&stale) ?? "").isEmpty ? nil : "Cloud Saves On"
@@ -143,6 +154,54 @@ private struct LauncherView: View {
                 try? await Task.sleep(for: .seconds(2))
             }
         }
+        // Rotation turns the screen as soon as it is picked, before Play (front_ios.m dm_rotation_set); the saved pick at once when the screen shows
+        .onAppear { if let v = m.values["DM_ROTATION"] { dm_rotation_set(v) } }
+        .onChange(of: m.values["DM_ROTATION"]) { _, v in if let v { dm_rotation_set(v) } }
+    }
+
+    private func header(icon size: CGFloat) -> some View {
+        VStack(spacing: size > 64 ? 16 : 8) {
+            if let icon = appIcon() {
+                Image(uiImage: icon).resizable().frame(width: size, height: size)
+                    .clipShape(RoundedRectangle(cornerRadius: size * 22 / 96))
+                    .accessibilityHidden(true)
+            }
+            Text((info("CFBundleDisplayName") as? String) ?? "Game")
+                .font(.title.weight(.bold)).multilineTextAlignment(.center)
+            Text("Version \((info("CFBundleShortVersionString") as? String) ?? "")")
+                .font(.callout).foregroundStyle(.secondary)
+            playButton
+        }
+    }
+
+    private var settingsList: some View {
+        List {
+            ForEach(m.sections, id: \.self) { section in
+                let rows = m.rows(in: section)
+                if !rows.isEmpty {
+                    Section(section) {
+                        ForEach(rows) { SettingRow(s: $0, m: m) }
+                    }
+                }
+            }
+            Section {
+                Button("Reset to tested defaults") { m.reset() }
+                    .disabled(!m.changed)
+            } footer: {
+                Text("Brings back all settings this game was tested with.")
+            }
+            // The background save check reads the selected folder until it returns.
+            CloudSavesSection(checking: checking)
+            Section {
+                HStack {
+                    Text("Memory available")
+                    Spacer()
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .contentMargins(.horizontal, 12, for: .scrollContent)
     }
 
     // the title over the picture
@@ -151,23 +210,40 @@ private struct LauncherView: View {
             Text("Continue Your Journey").font(.footnote).foregroundStyle(LauncherTheme.soft)
             Text(LauncherBackgroundStore.title()).font(.system(size: 28, weight: .bold)).foregroundStyle(LauncherTheme.text)
                 .shadow(color: .black.opacity(0.5), radius: 8, y: 2).lineLimit(1).minimumScaleFactor(0.6)
-            Text(statusLine).font(.footnote).foregroundStyle(LauncherTheme.soft).lineLimit(1)
+            Text(([statusLine] + (mods.enabledCount > 0 ? ["\(mods.enabledCount) Mod\(mods.enabledCount == 1 ? "" : "s") On"] : [])).filter { !$0.isEmpty }.joined(separator: " · "))
+                .font(.footnote).foregroundStyle(LauncherTheme.soft).lineLimit(1)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
-    // Play, and All Settings under it
+    // Play, and under it in one row centered on it: Mods (with how many are on), then All Settings
     private var sideButtons: some View {
         VStack(spacing: 10) {
             playButton
-            Button { withAnimation(.easeOut(duration: 0.25)) { drawer = true } } label: {
-                Label("All Settings", systemImage: "slider.horizontal.3").font(.footnote.weight(.semibold)).foregroundStyle(LauncherTheme.text)
-                    .padding(.horizontal, 14).padding(.vertical, 9)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .overlay(Capsule().strokeBorder(LauncherTheme.paleGold.opacity(0.3), lineWidth: 1))
+            HStack(spacing: 8) {
+                capsule {
+                    HStack(spacing: 6) {
+                        Label("Mods", systemImage: "puzzlepiece.extension")
+                        if mods.enabledCount > 0 {
+                            Text("\(mods.enabledCount)").font(.caption2.weight(.bold)).monospacedDigit().foregroundStyle(LauncherTheme.onGold)
+                                .padding(.horizontal, 6).padding(.vertical, 1).background(LauncherTheme.gold, in: Capsule())
+                        }
+                    }
+                } action: { withAnimation(.easeOut(duration: 0.25)) { drawer = false; modsDrawer = true } }
+                .accessibilityLabel(mods.enabledCount > 0 ? "Mods, \(mods.enabledCount) on" : "Mods")
+                capsule { Label("All Settings", systemImage: "slider.horizontal.3") } action: { withAnimation(.easeOut(duration: 0.25)) { modsDrawer = false; drawer = true } }
             }
-            .buttonStyle(.plain)
+            .fixedSize()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+    }
+    private func capsule<L: View>(@ViewBuilder _ label: () -> L, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            label().font(.footnote.weight(.semibold)).foregroundStyle(LauncherTheme.text).lineLimit(1)
+                .padding(.horizontal, 14).padding(.vertical, 9)
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay(Capsule().strokeBorder(LauncherTheme.paleGold.opacity(0.3), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
     }
     private var tileSettings: [(Setting, String, String)] {
         Self.tiles.compactMap { t in m.settings.first(where: { $0.env == t.0 && $0.kind == "toggle" }).map { ($0, t.1, t.2) } }
@@ -195,14 +271,17 @@ private struct LauncherView: View {
         .frame(maxWidth: max(width, 236), alignment: .bottomLeading)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
     }
-    private func closeDrawer() { withAnimation(.easeOut(duration: 0.25)) { drawer = false } }
+    private func closeDrawer() { withAnimation(.easeOut(duration: 0.25)) { drawer = false; modsDrawer = false } }
     @ViewBuilder private var drawerOverlay: some View {
-        if drawer {
+        if drawer || modsDrawer {
             GeometryReader { g in
                 HStack(spacing: 0) {
                     Color.black.opacity(0.001).onTapGesture(perform: closeDrawer)
-                    AllSettingsDrawer(m: m, close: closeDrawer, backgroundChanged: { background = LauncherBackgroundStore.image() }, memory: memory)
-                        .frame(width: max(360, g.size.width * 0.6))
+                    Group {
+                        if modsDrawer { ModsDrawer(store: mods, close: closeDrawer) }
+                        else { AllSettingsDrawer(m: m, close: closeDrawer, backgroundChanged: { background = LauncherBackgroundStore.image() }, memory: memory) }
+                    }
+                    .frame(width: max(360, g.size.width * 0.6))
                 }
             }
             .ignoresSafeArea(edges: .vertical)
@@ -224,7 +303,7 @@ private struct LauncherView: View {
         if checking {
             VStack(spacing: 6) {
                 HStack(spacing: 6) { ProgressView(); Text("Checking the Cloud Save…").font(.footnote).foregroundStyle(LauncherTheme.soft) }
-                Button("Play Without It") { checking = false; go("offline") }.font(.footnote).foregroundStyle(LauncherTheme.paleGold)
+                Button("Play Without It") { check += 1; checking = false; go("offline") }.font(.footnote).foregroundStyle(LauncherTheme.paleGold)
             }
         } else {
             Text("Play").font(.headline).foregroundStyle(LauncherTheme.paleGold).shadow(color: .black.opacity(0.6), radius: 6)
@@ -315,12 +394,13 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
         if lo > 0 { LauncherModel.screenAspect = Double(max(sz.width, sz.height) / lo) }
     }
     gameMenuModel = model   // the in-game menu shows and saves the same choices (GameMenu.swift)
-    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.applySaved(); return false }
+    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.applySaved(); ModStore.applyEnv(); return false }
     let parent = Unmanaged<UIViewController>.fromOpaque(viewController).takeUnretainedValue()
     var host: UIViewController?
     let view = LauncherView(m: model) {
         guard let h = host else { return }
         host = nil
+        ModStore.applyEnv()   // DM_MODS: the mods that are on (Mods.swift)
         model.apply()
         h.dismiss(animated: false) { done() }
     }

@@ -13,7 +13,7 @@ RSTB = 'System/Resource/ResourceSizeTable.Product.111.Nin_Ounce_NVN2.rsizetable.
 def rstb_raise(z, factor=2):
     # the resource size table (REST: CRC32 of the path → bytes the game reserves for loading the file) with this file's entry raised: the game's heap for the file
     # comes from it, and a 2,448-byte rewrite of the 1,476-byte file ran it out (a null allocation at main+0xe156e4, crash at 5 s). Returns the new .zs bytes.
-    import zstandard
+    import zstandard  # pyright: ignore[reportMissingImports]
     d = bytearray(zstandard.ZstdDecompressor().decompress(z, max_output_size=1 << 28)); assert d[:4] == b'REST', 'not a resource size table'
     key = struct.pack('<I', zlib.crc32(PATH.encode())); i = d.find(key)
     assert i > 0 and d.find(key, i + 1) == -1, 'the size table has no single entry for ' + PATH
@@ -24,9 +24,10 @@ def rstb_raise(z, factor=2):
 # ---- BYML v7 (little endian), the node types this file uses: dict C1, array C0, string A0, bool D0, int D1, float D2, uint D3 ----
 class T:   # a typed scalar, so a round trip keeps each value's node type
     __slots__ = ('t', 'v')
-    def __init__(s, t, v): s.t, s.v = t, v
-    def __eq__(s, o): return isinstance(o, T) and s.t == o.t and s.v == o.v
-    def __repr__(s): return 'T(%#x,%r)' % (s.t, s.v)
+    def __init__(self, t, v): self.t, self.v = t, v
+    def __eq__(self, o): return isinstance(o, T) and self.t == o.t and self.v == o.v
+    def __hash__(self): return hash((self.t, self.v))
+    def __repr__(self): return 'T(%#x,%r)' % (self.t, self.v)
 
 def parse(b):
     assert b[:2] == b'YB', 'not a little-endian BYML'
@@ -65,8 +66,8 @@ def write(ver, root):
             for v in x: collect(v)
         elif x.t == 0xA0: strs.add(x.v)
     collect(root)
-    keys = sorted(keys, key=lambda s: s.encode()); strs = sorted(strs, key=lambda s: s.encode())
-    ki = {k: i for i, k in enumerate(keys)}; si = {s: i for i, s in enumerate(strs)}
+    key_list = sorted(keys, key=lambda s: s.encode()); str_list = sorted(strs, key=lambda s: s.encode())
+    ki = {k: i for i, k in enumerate(key_list)}; si = {s: i for i, s in enumerate(str_list)}
     out = bytearray(16)
     def align():
         while len(out) % 4: out.append(0)
@@ -75,7 +76,7 @@ def write(ver, root):
         off = len(out); out.extend(struct.pack('<I', 0xC2 | len(lst) << 8)); table = len(out); out.extend(b'\0' * 4 * (len(lst) + 1))
         for i, s in enumerate(lst): struct.pack_into('<I', out, table + 4 * i, len(out) - off); out.extend(s.encode() + b'\0')
         struct.pack_into('<I', out, table + 4 * len(lst), len(out) - off); align(); return off
-    kt = strtab(keys); st = strtab(strs)
+    kt = strtab(key_list); st = strtab(str_list)
     def val(x):   # (type, u32): containers are written after their parent (breadth first), so their slot is patched later
         if isinstance(x, (dict, list)): return (0xC1 if isinstance(x, dict) else 0xC0), None
         if x.t == 0xA0: return x.t, si[x.v]
@@ -111,6 +112,7 @@ def write(ver, root):
 
 def variant(data, nolimit, x2):
     import copy; d = copy.deepcopy(data)
+    assert isinstance(d, dict)
     for e in d['AmiiboDropActorSettingSet']:
         if nolimit: e['EnableDailyLimit'] = T(0xD0, 0)
         dl = e.get('DropActorInfoList')
