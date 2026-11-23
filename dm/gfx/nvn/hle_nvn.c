@@ -4033,6 +4033,7 @@ static int vshadow_map(struct vpool *v, const map_req *r, const uint8_t *src) { 
     memcpy(to, src, r->size);
     uint8_t *abase = NULL; uint64_t alen = 0;
     uint8_t *alias = vshadow_phys_alias(src, r->size, &abase, &alen);
+    if (v->nsh < 0) die("sparse pool copy table corrupted");
     if (v->nsh == v->csh) { int nc = v->csh ? 2 * v->csh : 64; void *nv = realloc(v->sh, (size_t)nc * sizeof *v->sh); if (!nv) die("sparse pool copy table allocation failed"); v->sh = nv; v->csh = nc; }
     v->sh[v->nsh++] = (struct vshadow){(uint64_t)r->voff, r->size, src, abase, alias, alen, stamp, NULL, vshadow_npages(src, r->size)};
     for (uint64_t o = 0; o < r->size; o += 0x1000) { vpte *e = (vpte *)vpt_get(v, (uint64_t)r->voff + o); if (e) e->shadow = 1; }

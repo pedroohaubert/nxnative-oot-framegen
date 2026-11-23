@@ -2860,6 +2860,7 @@ void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) {
 }
 
 static void post(post_op o) {
+    if (g_npost < 0) g_npost = 0;
     if (g_npost == g_postcap) { g_postcap = g_postcap ? g_postcap * 2 : 64; g_post = realloc_or_die(g_post, g_postcap * sizeof *g_post, "the deferred operations"); }
     g_post[g_npost++] = o;
 }
@@ -17780,7 +17781,7 @@ static int rt_has_depth(void) {
 static void draw(const p_draw *dw, const p_draw_idx *di) { cp_stamp start = cp_begin(); if (dw && dw->prim == DM_PRIM_MESH_TASKS) mesh_tasks_draw(dw); else draw_(dw, di); cp_end(5, start); }
 static void draw_(const p_draw *dw, const p_draw_idx *di) {
     g_draw_binst = (uint32_t)(dw ? dw->base_instance : di ? di->base_instance : 0);   // c0 + 0x644 of the stages that read the driver segment (encode_args)
-    if (vislog_on() && (int)(dw ? dw->count : di->count) == g_vislog) { g_vislog_mark = 1; atomic_fetch_add_explicit(&g_vislog_draws, 1, memory_order_relaxed); }   // DM_NVN_VISLOG
+    if (vislog_on() && (int)(dw ? dw->count : di ? di->count : 0) == g_vislog) { g_vislog_mark = 1; atomic_fetch_add_explicit(&g_vislog_draws, 1, memory_order_relaxed); }   // DM_NVN_VISLOG
     if (passdump()) { NvProg *p = g_geo_program ? g_geo_program : S.prog ? prog_get(S.prog) : nil;
         PD("j %llu draw-entry vs=%s fs=%s gs=%s prim=%d count=%d instances=%d indexed=%d indirect=%#llx discard=%d feedback=%d", g_stat_pass + !g_enc,
            p && p->sh[0] ? p->sh[0]->key : "-", p && p->sh[1] ? p->sh[1]->key : "-", p && p->sh[2] ? p->sh[2]->key : "-",
