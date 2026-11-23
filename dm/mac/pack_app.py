@@ -130,7 +130,6 @@ def info_plist(a, minos, icon):
          'CFBundleVersion': a.version or '1.0', 'CFBundleShortVersionString': a.version or '1.0', 'CFBundlePackageType': 'APPL', 'CFBundleExecutable': EXE,
          'CFBundleInfoDictionaryVersion': '6.0', 'LSMinimumSystemVersion': minos, 'LSArchitecturePriority': ['arm64'], 'NSHighResolutionCapable': True,
          'NSBluetoothAlwaysUsageDescription': 'Connect Switch 2 Joy-Con and Pro Controllers over Bluetooth.',
-         'NSMicrophoneUsageDescription': 'With Microphone on in the settings, a game that listens (such as playing the ocarina by voice) hears you through the microphone.',   # mic_apple.m: without it DM_MIC offers no input device
          'LSApplicationCategoryType': a.category or 'public.app-category.games', 'LSSupportsGameMode': False, 'DMTitleID': a.title_id.upper(), 'DMRomfsMarker': a.marker or '', 'DMLanguage': a.lang or 'en-US', 'DMSaveSyncChoice': 1}
     if icon: p['CFBundleIconFile'] = 'AppIcon'
     if a.settings:
