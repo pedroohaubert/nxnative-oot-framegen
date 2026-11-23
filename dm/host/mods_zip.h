@@ -103,7 +103,7 @@ static void mods_dir_walk(mods_zip *z, const char *base, const char *rel, size_t
         if (lstat(full, &st)) continue;
         if (S_ISDIR(st.st_mode)) { if (depth < 32) mods_dir_walk(z, base, r, cap, depth + 1); continue; }
         if (!S_ISREG(st.st_mode)) continue;
-        if (z->n == *cap && !(z->e = realloc(z->e, (*cap = *cap ? 2 * *cap : 256) * sizeof *z->e))) { MODS_LOG("[RED] mods: out of memory"); abort(); }
+        if (z->n == *cap) { size_t nc = *cap ? 2 * *cap : 256; void *nv = realloc(z->e, nc * sizeof *z->e); if (!nv) { MODS_LOG("[RED] mods: out of memory"); abort(); } z->e = nv; *cap = nc; }
         mods_zent *x = &z->e[z->n++]; memset(x, 0, sizeof *x);
         x->name = strdup(r); x->usize = x->csize = (uint64_t)st.st_size; x->method = 0xffff;   // 0xffff: a file to copy
     }

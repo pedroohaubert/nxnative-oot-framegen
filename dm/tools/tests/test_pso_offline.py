@@ -21,6 +21,7 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location('pso_offline', REPO / 'dm/gfx/tools/pso_offline.py')
+assert spec and spec.loader
 po = importlib.util.module_from_spec(spec); spec.loader.exec_module(po)
 CHAIN = '0123456789ab'
 
@@ -243,7 +244,7 @@ class Layouts(unittest.TestCase):
     def test_rows_read_checked_and_after_the_pairs(self):
         rows = ['# header', f'v_b\tmain0\tf_b\tmain0\t{self.vd}', f'v_b\tmain0\tf_b\tmain0_u\t{self.vd}', f'v_b\tmain0\tf_b\tmain0\t{self.vd}',   # the repeat is read once
                 f'v_b\tmain0\tg_b\tmain0\t{self.vd}', f'v_b\tmain0\th_b\tmain0\t{self.vd}', f'x_b\tmain0\tf_b\tmain0\t{self.vd}', f'v_b\tmain9\tf_b\tmain0\t{self.vd}',
-                'v_b\tmain0\tf_b\tmain0', f'v_b\tmain0\tf_b\tmain0\t{{not json']
+                'v_b\tmain0\tf_b\tmain0', 'v_b\tmain0\tf_b\tmain0\t{not json']
         p = self.d.parent / 'pso_layouts.tsv'; p.write_text('\n'.join(rows) + '\n')
         out, left = po.read_layouts(self.d, [str(p), str(self.d.parent / 'missing.tsv')])
         self.assertEqual([b[:4] for b in out], [('v_b', 'main0', 'f_b', 'main0'), ('v_b', 'main0', 'f_b', 'main0_u'), ('v_b', 'main0', 'g_b', 'main0')])
@@ -261,7 +262,7 @@ class Layouts(unittest.TestCase):
         self.assertEqual(po.library_digest(self.d, [('v_b', 'main0', 'g_b', 'main0', self.vd)]), po.library_digest(self.d, [('v_b', 'main0', 'g_b', 'main0')]))   # the same libraries
 
     def test_capture_converts_to_rows(self):
-        cap = importlib.util.spec_from_file_location('pso_capture', REPO / 'dm/gfx/tools/pso_capture.py'); pc = importlib.util.module_from_spec(cap); cap.loader.exec_module(pc)
+        cap = importlib.util.spec_from_file_location('pso_capture', REPO / 'dm/gfx/tools/pso_capture.py'); assert cap and cap.loader; pc = importlib.util.module_from_spec(cap); cap.loader.exec_module(pc)
         hv = hashlib.sha256((self.d / 'v_b.metallib').read_bytes()).hexdigest().upper(); hf = hashlib.sha256((self.d / 'f_b.metallib').read_bytes()).hexdigest().upper()
         hg = hashlib.sha256((self.d / 'g_b.metallib').read_bytes()).hexdigest().upper()
         unspec = [{'pixel_format': 'Unspecialized'}] * 8

@@ -12793,7 +12793,7 @@ static void *pso_get_(NvProg *pr, MTLRenderPassDescriptor *unused) {
         why = !vs->has_pull || vs->layer_out ? 3 : 4;
         int st = pso_pend_try(&k, &ps);
         __unsafe_unretained id<MTLRenderPipelineState> hr = st == 0 && pso_refused_recent(&k) ? hm_get_id(&g_pso_hy, &k) : nil;
-        if (hr) { g_pp_refused_skips++; g_pso_pull = 1; g_hy_ns += bp_now() - bt; return hr; }   // refused a moment ago: its stand-in, no lookup (pso_refused_recent)
+        if (hr) { g_pp_refused_skips++; g_pso_pull = 1; g_hy_ns += bp_now() - bt; return (__bridge void *)hr; }   // refused a moment ago: its stand-in, no lookup (pso_refused_recent)
         if (st == 2) took = 1;   // built in the background (nil: it failed, and is built again below for its message)
         else {
             if (st == 0) ps = pso_build_ex(pso_desc(&k, vs, fs, nil, 0), pso_off(&k, fs, 0), &e, 0);   // its base made or archived: no compile
@@ -15021,7 +15021,7 @@ static uint64_t cbuf_slot(NvShader *sh, int nvn_stage, const nvn_rbind *b, __uns
         if (__builtin_expect(ws, 0) && u->size >= 16) { float sv[3]; memcpy(sv, (const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo, sizeof sv);
             if (fabsf(sv[0] - 0.1f) < 1e-6f && sv[1] > 1000 && fabsf(sv[2] - 1.7777778f) < 1e-4f) probe_watch_at(u->addr + 8, 4); } }
     if (nvn_stage == 0 && u->size >= 144 && wide2d_on() && !(g_nubd && ubd_hits(u->addr, u->addr + ul))) {   // Wide view's HUD (wide2d_fix)
-        uint64_t w = wide2d_fix((const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo, ul > u->size ? u->size : ul, use); if (w) return w; }
+        id<MTLBuffer> wb = nil; uint64_t w = wide2d_fix((const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo, ul > u->size ? u->size : ul, &wb); if (w) { *use = wb; return w; } }
     if (g_nubd && ubd_hits(u->addr, u->addr + ul)) {   // inline updates deferred in this pass (see mtl_sub_update); ubd_conflict made sure they cover the binding or the rest can be read from memory
         uint64_t g; const uint8_t *c; if (ubd_covers(u->addr, u->addr + ul)) gpu = ubd_shadow(u->addr, u->addr + ul);
         else if (ubp_get(u->addr, u->addr + ul, &g, &c)) gpu = g;

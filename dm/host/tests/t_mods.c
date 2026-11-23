@@ -27,7 +27,8 @@ static void zs(const char *path, uint32_t content) {
 static void text(const char *path, size_t n) { char *b = malloc(n); memset(b, 'x', n); wfile(path, b, n); free(b); }
 static char *slurp(const char *path, size_t *n) {
     FILE *f = fopen(path, "rb"); if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long k = ftell(f); fseek(f, 0, SEEK_SET); char *b = malloc((size_t)k + 1); *n = fread(b, 1, (size_t)k, f); b[*n] = 0; fclose(f); return b;
+    fseek(f, 0, SEEK_END); long k = ftell(f); if (k < 0) { fclose(f); return NULL; }
+    fseek(f, 0, SEEK_SET); char *b = malloc((size_t)k + 1); *n = fread(b, 1, (size_t)k, f); b[*n] = 0; fclose(f); return b;
 }
 static int exists(const char *p) { return !access(p, F_OK); }
 
@@ -60,7 +61,8 @@ static uint32_t frame_entry(const char *file, const char *path, int *ok) {
 // A zip of stored entries, written here so the test can make what zip(1) will not: "..", an encrypted flag, another method, a wrong CRC
 typedef struct { const char *name; const char *data; uint16_t method, flags; int bad_crc; } zent;
 static void mkzip(const char *path, const zent *e, int n) {
-    FILE *f = fopen(path, "wb"); uint32_t off[16]; uint8_t h[46];
+    FILE *f = fopen(path, "wb"); if (!f) { printf("cannot write %s\n", path); exit(1); }
+    uint32_t off[16]; uint8_t h[46];
     for (int i = 0; i < n; i++) {
         size_t dl = strlen(e[i].data), nl = strlen(e[i].name); uint32_t crc = mods_crc32(0, e[i].data, dl) ^ (uint32_t)e[i].bad_crc;
         off[i] = (uint32_t)ftell(f); memset(h, 0, 30);
@@ -77,6 +79,7 @@ static void mkzip(const char *path, const zent *e, int n) {
     uint32_t cdn = (uint32_t)ftell(f) - cd; uint8_t eo[22] = {0}; mods_wr32(eo, 0x06054b50u); eo[8] = eo[10] = (uint8_t)n; mods_wr32(eo + 12, cdn); mods_wr32(eo + 16, cd);
     fwrite(eo, 1, 22, f); fclose(f);
 }
+// NOLINTNEXTLINE(bugprone-command-processor)
 static int sh(const char *fmt, ...) { char c[2048]; va_list a; va_start(a, fmt); vsnprintf(c, sizeof c, fmt, a); va_end(a); return system(c); }
 static int count_dir(const char *d) {   // entries in a folder, hidden ones too (a failed import must leave no .import-* behind)
     DIR *x = opendir(d); int n = 0; struct dirent *e; if (!x) return -1;

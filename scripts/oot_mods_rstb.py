@@ -9,7 +9,7 @@ import sys, os, struct
 
 def unzstd(z):
     try:
-        import zstandard
+        import zstandard  # pyright: ignore[reportMissingImports]
         return zstandard.ZstdDecompressor().decompress(z, max_output_size=1 << 28)
     except ImportError:   # the zstd tool, where Python has no zstandard
         import subprocess

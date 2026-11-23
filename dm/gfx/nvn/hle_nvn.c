@@ -3821,7 +3821,7 @@ static uint8_t *vpool_reserve(pool_t *o) {   // → the reserved range, or NULL
     if (!v || !(v->pt = calloc((o->size + (2u << 20) - 1) >> 21, sizeof *v->pt))) die("sparse pool allocation failed");
     v->pool = o; v->base = a; v->len = len; v->size = o->size;
     pthread_mutex_lock(&g_vp_mu);
-    if (g_nvp == g_cvp && !(g_vp = realloc(g_vp, (g_cvp = g_cvp ? 2 * g_cvp : 64) * sizeof *g_vp))) die("sparse pool table allocation failed");
+    if (g_nvp == g_cvp) { int nc = g_cvp ? 2 * g_cvp : 64; void *nv = realloc(g_vp, (size_t)nc * sizeof *g_vp); if (!nv) die("sparse pool table allocation failed"); g_vp = nv; g_cvp = nc; }
     g_vp[g_nvp++] = v; o->vp = v;
     o->vmode = o->size > DM_GAME_APP_POOL ? 2 : 0;
     pthread_mutex_unlock(&g_vp_mu);
@@ -4000,7 +4000,7 @@ static void vshadow_cut(struct vpool *v, uint64_t lo, uint64_t hi) {   // drop o
         if (b > hi) piece[np++] = vshadow_slice(&e, hi, b - hi);
         vshadow_free(&e);
         for (int k = 0; k < np; k++) {
-            if (v->nsh == v->csh && !(v->sh = realloc(v->sh, (size_t)(v->csh = v->csh ? 2 * v->csh : 64) * sizeof *v->sh))) die("sparse pool copy table allocation failed");
+            if (v->nsh == v->csh) { int nc = v->csh ? 2 * v->csh : 64; void *nv = realloc(v->sh, (size_t)nc * sizeof *v->sh); if (!nv) die("sparse pool copy table allocation failed"); v->sh = nv; v->csh = nc; }
             v->sh[v->nsh++] = piece[k];
             atomic_fetch_add(&g_sh_bytes, piece[k].size);
         }
@@ -4033,7 +4033,7 @@ static int vshadow_map(struct vpool *v, const map_req *r, const uint8_t *src) { 
     memcpy(to, src, r->size);
     uint8_t *abase = NULL; uint64_t alen = 0;
     uint8_t *alias = vshadow_phys_alias(src, r->size, &abase, &alen);
-    if (v->nsh == v->csh && !(v->sh = realloc(v->sh, (size_t)(v->csh = v->csh ? 2 * v->csh : 64) * sizeof *v->sh))) die("sparse pool copy table allocation failed");
+    if (v->nsh == v->csh) { int nc = v->csh ? 2 * v->csh : 64; void *nv = realloc(v->sh, (size_t)nc * sizeof *v->sh); if (!nv) die("sparse pool copy table allocation failed"); v->sh = nv; v->csh = nc; }
     v->sh[v->nsh++] = (struct vshadow){(uint64_t)r->voff, r->size, src, abase, alias, alen, stamp, NULL, vshadow_npages(src, r->size)};
     for (uint64_t o = 0; o < r->size; o += 0x1000) { vpte *e = (vpte *)vpt_get(v, (uint64_t)r->voff + o); if (e) e->shadow = 1; }
     vshadow_written(v, (uint64_t)r->voff, (uint64_t)r->voff + r->size);

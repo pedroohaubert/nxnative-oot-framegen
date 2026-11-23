@@ -37,13 +37,13 @@ def library_names(lib_dir, wanted):
 
 
 def host_constants(values):
-    """Whether constant_values set exactly what the host's prebuild sets (HOST_CONSTANTS, by index)"""
+    """Whether constant_values set a non-empty subset of what the host's prebuild sets (HOST_CONSTANTS, by index)"""
     want = {i: v for i, v in pso_offline.HOST_CONSTANTS.values()}
     got = {}
     for c in values or ():
         if c.get('id_type') != 'FunctionConstantIndex' or c.get('value_type') != 'ConstantBool': return False
         got[(c.get('id') or {}).get('data')] = (c.get('value') or {}).get('data')
-    return got == want
+    return bool(got) and all(k in want and want[k] == v for k, v in got.items())
 
 
 def convert(scripts, lib_dir):
@@ -57,7 +57,7 @@ def convert(scripts, lib_dir):
         fds = d.get('function_descriptors', {})
         plain = {f['label']: (libs.get(f['library']), f['name'], None) for f in fds.get('library_function_descriptors', [])}
         spec = {f['label']: (f['function_descriptor'].split(':', 1)[-1], f.get('constant_values')) for f in fds.get('specialized_function_descriptors', [])}
-        def resolve(ref):   # → (library, entry, ok) for a function descriptor reference
+        def resolve(ref, plain=plain, spec=spec):   # → (library, entry, ok) for a function descriptor reference
             label = (ref or '').split(':', 1)[-1]
             if label in plain: lib, name, _ = plain[label]; return lib, name, 'plain'
             if label in spec:

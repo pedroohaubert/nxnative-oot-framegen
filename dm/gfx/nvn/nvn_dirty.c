@@ -260,7 +260,7 @@ static int pending(range_t *r, uintptr_t p) {
     if (f && atomic_load_explicit(&g_dframe, memory_order_relaxed) + 1 - f < 2) return 1;
     uint32_t vt = r->veto ? atomic_load(&r->veto[p]) : 0, fr = atomic_load_explicit(&g_dframe, memory_order_relaxed) + 1;
     if (f && fr - f <= HOT_GAP && g_hot_on && r->streak && atomic_load(&r->streak[p]) >= HOT_RUN && (!vt || fr - vt > HOT_VETO)) {   // its faults keep coming back: hot instead of protected again
-        if (g_nhot < HOT_MAX) { g_hot[g_nhot++] = (hot_ent){r, p, page_hash((const void *)(rb(r) + (p << g_shift))), 0}; atomic_store(&r->hotf[p], 1); atomic_fetch_add(&g_hot_made, 1); return 1; }
+        if (g_nhot >= 0 && g_nhot < HOT_MAX) { g_hot[g_nhot++] = (hot_ent){r, p, page_hash((const void *)(rb(r) + (p << g_shift))), 0}; atomic_store(&r->hotf[p], 1); atomic_fetch_add(&g_hot_made, 1); return 1; }
         atomic_fetch_add(&g_hot_full, 1);
     }
     // pend keeps the frame of the last faulting write after its pending frame has passed: pend_note measures the next fault's gap from it (cleared here, the streak never

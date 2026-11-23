@@ -61,7 +61,7 @@ def macros(shader_map):
         (Path(d, ID) / 'game.tsv').write_text(TSV)
         if shader_map is not None: (Path(d, ID) / 'shader_map.tsv').write_text(shader_map)
         subprocess.run([sys.executable, str(GAME), 'header', ID, str(Path(d, ID) / 'game.h')], env={**os.environ, 'DM_GAMES_DIR': d}, check=True, capture_output=True)
-        return [l for l in (Path(d, ID) / 'game.h').read_text().splitlines() if 'UPSCALER' in l]
+        return [l for l in (Path(d, ID) / 'game.h').read_text().splitlines() if 'UPSCALER_KEYS' in l or 'UPSCALER_N' in l]
 
 
 class UpscalerKeys(unittest.TestCase):

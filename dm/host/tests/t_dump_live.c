@@ -20,11 +20,14 @@ int main(void) {
     pthread_t th, hi; pthread_create(&th, NULL, worker, NULL); pthread_create(&hi, NULL, host_idle, NULL);
     while (!atomic_load(&in_lock)) usleep(100);
     usleep(20000);
-    char path[] = "/tmp/t_dump_live.XXXXXX"; int fd = mkstemp(path), save = dup(2); dup2(fd, 2);
+    char path[] = "/tmp/t_dump_live.XXXXXX"; int fd = mkstemp(path), save = dup(2);
+    if (fd < 0 || save < 0) return 1;
+    dup2(fd, 2);
     svc_thread_dump_live();
-    fflush(stderr); dup2(save, 2);
+    fflush(stderr); dup2(save, 2); close(save);
     pthread_mutex_unlock(&hm);
     for (int i = 0; i < 2000 && !atomic_load(&got); i++) usleep(1000);
+    // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection)
     char buf[16384] = {0}; lseek(fd, 0, SEEK_SET); ssize_t n = read(fd, buf, sizeof buf - 1); close(fd); unlink(path); (void)n;
     int ok = 1;
     if (!strstr(buf, "0x1050 id 0xa6 not in a guest wait")) { printf("FAIL: no host-frames line for the worker\n"); ok = 0; }

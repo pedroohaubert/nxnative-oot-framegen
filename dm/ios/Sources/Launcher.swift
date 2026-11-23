@@ -14,7 +14,7 @@ private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryK
 /// Cloud saves too). The host brings the save in from there when the game starts and
 /// sends it there after each save (dm/host/save_sync.h); the folder is a bookmark (CloudSaves.m).
 struct CloudSavesSection: View {
-    let checking: Bool = false
+    var checking: Bool = false
     @State private var folder: String = ""
     @State private var note: String = ""
     @State private var picking = false

@@ -205,7 +205,7 @@ MODS_FN void mods_walk(const char *root, const char *sub, int mod, mods_files *f
         if (lstat(full, &st)) continue;
         if (S_ISDIR(st.st_mode)) { if (depth < 32) mods_walk(root, rel, mod, f, depth + 1); }
         else if (S_ISREG(st.st_mode)) {
-            if (f->n == f->cap && !(f->v = realloc(f->v, (f->cap = f->cap ? 2 * f->cap : 256) * sizeof *f->v))) { MODS_LOG("[RED] mods: out of memory"); abort(); }
+            if (f->n == f->cap) { size_t nc = f->cap ? 2 * f->cap : 256; void *nv = realloc(f->v, nc * sizeof *f->v); if (!nv) { MODS_LOG("[RED] mods: out of memory"); abort(); } f->v = nv; f->cap = nc; }
             f->v[f->n].rel = strdup(rel); f->v[f->n].mod = mod; f->n++;
         }
     }
