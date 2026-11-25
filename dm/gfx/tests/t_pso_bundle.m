@@ -39,6 +39,24 @@ int main(void) { @autoreleasepool {
         NSMutableData *header = [NSMutableData dataWithLength:32]; memcpy(header.mutableBytes, magics[i], 4); [header writeToFile:bad atomically:YES];
         EXPECT("archive guard: bare header refused", 0, arch_file_ok(bad));
     }
+    // # cover padding sections are skipped by pre_parse and pre_parse_files, resetting on # kind: and isolating headerless later files (no Metal compiler needed).
+    @autoreleasepool {
+        NSString *cov = @"# kind: evidence\nv1\tf1\n# cover: single-stage padding pairs\nv1\tf2\n# kind: evidence\nv1\tfc\n# cover\nv1\tf3\n";
+        EXPECT("cover: pre_parse skips # cover and resets on # kind:", 2, pre_parse(cov).count);
+        EXPECT("cover: pre_parse_files isolates headerless second file", 2, pre_parse_files(@[@"# kind: evidence\nv1\tf1\n# cover: padding\nv1\tf2\n", @"v1\tfc\n"]).count);
+        EXPECT("cover: pre_parse_files deduplicates across files", 1, pre_parse_files(@[@"v1\tf1\n", @"v1\tf1\n"]).count);
+        EXPECT("cover: pre_parse_files deduplicates with extra columns", 1, pre_parse_files(@[@"v1\tf1\textra\n", @"v1\tf1\n"]).count);
+        NSMutableSet<NSString *> *left = [NSMutableSet set];
+        pre_parse_into(@"v1\tf1\textra\n# cover\nv1\tf2\n", nil, left);
+        EXPECT("cover: pre_parse_into keys by vertex and pixel", 1, left.count == 1 && [left containsObject:pre_pair_key(@"v1", @"f1")] && ![left containsObject:pre_pair_key(@"v1", @"f2")]);
+        NSMutableString *big1 = [NSMutableString string], *big2 = [NSMutableString string];
+        for (int i = 0; i < 10000; i++) [big1 appendFormat:@"v%06d\tf%06d\n", i, i];
+        for (int i = 10000; i < 20000; i++) [big2 appendFormat:@"v%06d\tf%06d\n", i, i];
+        uint64_t t0 = bp_now();
+        NSArray<NSArray<NSString *> *> *big_pairs = pre_parse_files(@[big1, big2]);
+        uint64_t elapsed_ms = (bp_now() - t0) / 1000000ull;
+        EXPECT("cover: pre_parse_files handles 20,000 distinct pairs linearly", 1, big_pairs.count == 20000 && elapsed_ms < 2000);
+    }
     NSString *v = @"#include <metal_stdlib>\nusing namespace metal;\nstruct V { float4 p [[position]]; };\n"
         "vertex V main0(uint id [[vertex_id]]) { V o; float2 uv = float2((id << 1) & 2, id & 2); o.p = float4(uv * 2 - 1, 0, 1); return o; }\n"
         "vertex V main0_z(uint id [[vertex_id]]) { V o; float2 uv = float2((id << 1) & 2, id & 2); o.p = float4(uv * 2 - 1, 0.5, 1); return o; }\n";
@@ -217,6 +235,36 @@ int main(void) { @autoreleasepool {
             EXPECT("steady-state blend-off (FN_OFF_BORDER|FN_OFF_BLEND) is distinct", 0, p1 && [boArchive newRenderPipelineStateWithDescriptor:p1 error:nil] != nil);
         }
     }
+    // KK3 ballot workaround constant (dm_mwa3_fc) in both render and compute shaders: pso_offline.py specializes it per target OS (matching nvn_mtl.m mwa_on),
+    // so both bases and compute pipelines stay in the offline archive and hit on lookup through pre_desc, fn_load and cps_new_b
+    NSString *fm = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\nconstant bool dm_mwa3_fc [[function_constant(%d)]];\n"
+        "constant bool dm_mwa3 = is_function_constant_defined(dm_mwa3_fc) ? dm_mwa3_fc : true;\n"
+        "fragment float4 main0() { return float4(dm_mwa3 ? 1 : 0, 0, 0, 1); }\n", DMSH_MWA_FC];
+    NSString *cm = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\nconstant bool dm_mwa3_fc [[function_constant(%d)]];\n"
+        "constant bool dm_mwa3 = is_function_constant_defined(dm_mwa3_fc) ? dm_mwa3_fc : true;\n"
+        "kernel void main0(device uint *out [[buffer(0)]]) { out[0] = dm_mwa3 ? 1u : 0u; }\n", DMSH_MWA_FC];
+    if (!lib(msl, @"fm_b", fm) && !lib(msl, @"cm_b", cm)) {
+        put([msl stringByAppendingPathComponent:@"fm_b.json"], [NSString stringWithFormat:@"{\"chain\": \"%s\", \"entry\": \"main0\"}", DMSH_CHAIN]);
+        put([msl stringByAppendingPathComponent:@"cm_b.json"], [NSString stringWithFormat:@"{\"chain\": \"%s\", \"stage\": \"cs\", \"entry\": \"main0\"}", DMSH_CHAIN]);
+        put([tables stringByAppendingPathComponent:@"mwa.tsv"], @"v1\tfm\n");
+        put([tables stringByAppendingPathComponent:@"mwa_map.tsv"], @"p\t0\tcompute\tcm\ts\n");
+        NSString *mw = [root stringByAppendingPathComponent:@"mwa"];
+        int rc = sh([NSString stringWithFormat:@"python3 %@ --platform macos --gpu %@ --msl %@ --pairs %@/mwa.tsv --shader-map %@/mwa_map.tsv --out %@ --work %@/mwa-work --depth gl > %@/pso_mwa.log 2>&1",
+                     tool, gpu, msl, tables, tables, mw, root, root]);
+        EXPECT("mwa constant: pso_offline.py made the archive", 0, rc);
+        if (rc) fprintf(stderr, "%s\n", [NSString stringWithContentsOfFile:[root stringByAppendingPathComponent:@"pso_mwa.log"] encoding:NSUTF8StringEncoding error:nil].UTF8String);
+        NSString *mwPath = [mw stringByAppendingFormat:@"/%@.mtl4a", gpu];
+        id<MTL4Archive> mwArchive = arch_file_ok(mwPath) ? [g_dev newArchiveWithURL:[NSURL fileURLWithPath:mwPath] error:nil] : nil;
+        EXPECT("mwa constant: archive opened", 1, mwArchive != nil);
+        EXPECT("mwa constant: render base in archive (no rest_pairs)", 0, [NSFileManager.defaultManager fileExistsAtPath:[mw stringByAppendingPathComponent:@"rest_pairs.tsv"]]);
+        MTL4RenderPipelineDescriptor *dm = pre_desc(@"v1", @"fm", 0);
+        EXPECT("mwa constant: pre_desc render base found in archive", 1, dm && [mwArchive newRenderPipelineStateWithDescriptor:dm error:nil] != nil);
+        id<MTLLibrary> cl = lib_from_file([msl stringByAppendingPathComponent:@"cm_b.metallib"], NULL);
+        id<MTLFunction> cf = fn_load(cl, @"main0", NULL);
+        MTL4ComputePipelineDescriptor *cd = [MTL4ComputePipelineDescriptor new]; cd.computeFunctionDescriptor = fn4_of_b(cf, FN_OFF_BORDER);
+        EXPECT("mwa constant: compute shader recognized as host-specialized", 1, fd_host_fc(cd.computeFunctionDescriptor));
+        EXPECT("mwa constant: compute pipeline found in archive", 1, [mwArchive newComputePipelineStateWithDescriptor:cd error:nil] != nil);
+    }
     EXPECT("batched archive: full coverage stamp preserved", 1, [[NSString stringWithContentsOfFile:[batched stringByAppendingPathComponent:@"prebuilt.tsv"] encoding:NSUTF8StringEncoding error:nil]
             isEqualToString:[NSString stringWithContentsOfFile:[bundle stringByAppendingPathComponent:@"prebuilt.tsv"] encoding:NSUTF8StringEncoding error:nil]]);
     // its stamp matches: only the pair with function constants is built here
@@ -307,6 +355,17 @@ int main(void) { @autoreleasepool {
         g_bundle_layouts = 0; uint64_t asks = g_arch_asks;
         EXPECT("layouts: without layout_bases.tsv the bundle is not asked for it", 1, arch_lookup(m, 1, NULL) == nil && g_arch_asks == asks);
         g_arch_bundle = real; g_bundle_layouts = real_l; g_arch4 = r4; g_arch4p = r4p; setenv("DM_PSO_BUNDLE", bundle.UTF8String, 1);
+    }
+    // cover-only shader_pairs.tsv builds zero bases in pso_prebuild
+    @autoreleasepool {
+        NSString *sp = [tables stringByAppendingPathComponent:@"shader_pairs.tsv"];
+        NSString *saved = [NSString stringWithContentsOfFile:sp encoding:NSUTF8StringEncoding error:nil];
+        [NSFileManager.defaultManager removeItemAtPath:[arch stringByAppendingPathComponent:@"prebuilt.tsv"] error:nil];
+        put(sp, @"# kind: evidence\n# cover: single-stage padding pairs\nv1\tf1\nv1\tf2\n");
+        reset_counts();
+        EXPECT("cover-only: pso_prebuild builds nothing", -1, pso_prebuild(1, 1, QOS_CLASS_USER_INITIATED));
+        EXPECT("cover-only: zero bases built or archived", 0, g_pre_built + g_pre_archived);
+        put(sp, saved);
     }
     // a folder without this GPU's archive, and a file that is no archive (Metal crashed on one, and on a bare Mach-O header too): no archive, no crash
     @autoreleasepool {

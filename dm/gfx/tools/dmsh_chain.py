@@ -6,9 +6,10 @@
 # and their digest (inputs below) stamps the library: <cache dir>/b-<V>/inputs.tsv says which game and which inputs it was built from. c1_full.tsv / cb_extent.tsv name V and that digest in their
 # header (dm/tools/shader_lib.py table_head), and the host takes them only when both match its library; build_ipa.sh packs a library only when its digest is the profile's.
 # The build (dmsh_build.py) writes into <cache dir>/b-<V>/ and the reflection json records chain = V; at compile time the host takes V from dm/gfx/nvn/dmsh_chain.h, loads only from b-<V>/ and verifies each json.
-# Usage: dmsh_chain.py                 print V (default options)
-#       dmsh_chain.py --header        rewrite dm/gfx/nvn/dmsh_chain.h (run after changing any file listed above, and commit it with the change)
-#       dmsh_chain.py --inputs        print the digest of the current game profile's inputs (DM_GAME), as b-<V>/inputs.tsv records it
+# Usage: dmsh_chain.py                    print V (default options)
+#       dmsh_chain.py --header            rewrite dm/gfx/nvn/dmsh_chain.h (run after changing any file listed above, and commit it with the change)
+#       dmsh_chain.py --inputs            print the digest of the current game profile's inputs (DM_GAME), as b-<V>/inputs.tsv records it
+#       dmsh_chain.py --xlate-source-sha  print the digest of dmsh_xlate's own sources and vendored Ryujinx inputs (stamped into dmsh_xlate by native_tools.sh)
 #       (checking the tools against dmsh_chain.lock, and rewriting it, is tool_lock.py's: the checks decide no output, so they are outside V and the shaders' cache keys)
 # Environment: XLATE_DEBUG / XLATE_REDUCED (same meaning as in dmsh_build.py, default 1 / 1), DMSH_SCONST (dmsh_wide.constant_reads, default fp; non-default options yield a different V, which the host will not load)
 from typing import Any
@@ -16,7 +17,7 @@ import os, sys, ast, hashlib
 from pathlib import Path
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # Workspace root (game files, build outputs and run artifacts are all under it)
 HERE = os.path.dirname(os.path.abspath(__file__)); GFX = os.path.dirname(HERE); HOME = os.path.expanduser('~')
-FILES = ['tools/dmsh_chain.py', 'tools/dmsh_build.py', 'tools/dmsh_atomic.py', 'tools/dmsh_wide.py', 'tools/dmsh_fetch.py', 'tools/dmsh_vin.py', 'tools/dmsh_pull.py', 'tools/dmsh_pull.metal', 'tools/dmsh_alpha.py', 'tools/dmsh_logic.py', 'tools/dmsh_side.py', 'tools/dmsh_rewrite.py', 'tools/dmsh_reflect.py', 'tools/dmsh_entry.py', 'tools/dmsh_geometry.py', 'tools/dmsh_tess.py', 'tools/dmsh_mesh.py', 'tools/dmsh_meshstage.py', 'tools/dmsh_facts.py', 'tools/dmsh_ampere.py', 'nvn/dmsh_abi.h', 'tools/dmsh_abi.py', 'tools/dmsh_xlate/Program.cs', 'tools/dmsh_xlate/dmsh_xlate.csproj', '../ios/tools/ios_metal.py', 'tools/dmsh_chain.lock']
+FILES = ['tools/dmsh_chain.py', 'tools/dmsh_build.py', 'tools/dmsh_atomic.py', 'tools/dmsh_wide.py', 'tools/dmsh_fetch.py', 'tools/dmsh_vin.py', 'tools/dmsh_pull.py', 'tools/dmsh_pull.metal', 'tools/dmsh_alpha.py', 'tools/dmsh_logic.py', 'tools/dmsh_side.py', 'tools/dmsh_rewrite.py', 'tools/dmsh_reflect.py', 'tools/dmsh_entry.py', 'tools/dmsh_geometry.py', 'tools/dmsh_tess.py', 'tools/dmsh_mesh.py', 'tools/dmsh_meshstage.py', 'tools/dmsh_facts.py', 'tools/dmsh_ampere.py', 'tools/dmsh_metalwa.py', 'nvn/dmsh_abi.h', 'tools/dmsh_abi.py', 'tools/dmsh_xlate/Program.cs', 'tools/dmsh_xlate/dmsh_xlate.csproj', '../ios/tools/ios_metal.py', 'tools/dmsh_chain.lock']
 # This target-specific lowering lives in the vendored translator. Include its
 # sources as well as the rebuilt translator's fingerprint; no old shader cache can bypass it.
 FILES += ['../third_party/ryujinx/src/Ryujinx.Graphics.Shader/' + f for f in (
@@ -150,8 +151,30 @@ def write_stamp(lib, game_id, digest):   # read back by shader_lib.read_stamp (a
     with open(tmp, 'w') as f: f.write(f'# the game and the profile inputs this library was built from (dm/gfx/tools/dmsh_chain.py inputs)\ngame\t{game_id}\ninputs\t{digest}\n')
     os.replace(tmp, os.path.join(lib, STAMP))
 
-def xlate_source_sha():   # same convention as dmsh_xlate --source-sha: the embedded Program.cs and csproj concatenated in that order
-    return hashlib.sha256(b''.join(open(os.path.join(HERE, 'dmsh_xlate', f), 'rb').read() for f in ('Program.cs', 'dmsh_xlate.csproj'))).hexdigest()[:16]
+XLATE_RYU_SUFFIXES = ('.cs', '.csproj', '.glsl', '.props')
+
+def xlate_source_files(gfx_dir=None):
+    """All in-repo source files compiled into dmsh_xlate, sorted by POSIX path relative to dm/."""
+    gfx = Path(gfx_dir) if gfx_dir is not None else Path(GFX)
+    dm_dir = gfx.parent
+    files = [gfx / 'tools/dmsh_xlate/Program.cs', gfx / 'tools/dmsh_xlate/dmsh_xlate.csproj']
+    ryu = dm_dir / 'third_party/ryujinx'
+    if ryu.is_dir():
+        for root, dirs, names in os.walk(ryu):
+            dirs[:] = sorted(d for d in dirs if d not in ('bin', 'obj') and not d.startswith('.'))
+            for name in sorted(names):
+                if name.startswith('.') or not name.endswith(XLATE_RYU_SUFFIXES):
+                    continue
+                files.append(Path(root) / name)
+    return sorted(files, key=lambda p: p.relative_to(dm_dir).as_posix())
+
+def xlate_source_sha(gfx_dir=None):   # stamped into dmsh_xlate by native_tools.sh (dmsh_xlate --source-sha): Program.cs, dmsh_xlate.csproj and all compiled dm/third_party/ryujinx inputs
+    gfx = Path(gfx_dir) if gfx_dir is not None else Path(GFX)
+    dm_dir = gfx.parent
+    h = hashlib.sha256()
+    for p in xlate_source_files(gfx):
+        h.update(p.relative_to(dm_dir).as_posix().encode() + b'\0' + p.read_bytes() + b'\0')
+    return h.hexdigest()[:16]
 
 def header_text(v):
     return (f'// Generated file (dm/gfx/tools/dmsh_chain.py --header): the B shader library translation chain version this source tree expects (default options), one for every game;\n'
@@ -164,5 +187,6 @@ if __name__ == '__main__':
         open(HEADER, 'w').write(header_text(version()))
         print(version())
     elif a == ['--inputs']: print(inputs(load_game()))
+    elif a == ['--xlate-source-sha']: print(xlate_source_sha())
     elif not a: print(version())
     else: sys.exit(__doc__ if __doc__ else 'usage: see the file header')
