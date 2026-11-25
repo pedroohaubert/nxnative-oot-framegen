@@ -14,7 +14,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-int dm_sdk_ounce(void) { return 0; }
 #include "../hle_svc.c"
 #include "../hle_exl.c"
 

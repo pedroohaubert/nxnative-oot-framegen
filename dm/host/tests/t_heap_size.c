@@ -10,7 +10,6 @@
 static int heap_mprotect(void *addr, size_t size, int prot);
 static void *heap_mmap(void *addr, size_t size, int prot, int flags, int fd, off_t offset);
 static _Noreturn void heap_abort(void);
-int dm_sdk_ounce(void) { return 0; }
 // Substitution is confined to this translation unit; production needs no test API.
 #define mprotect heap_mprotect
 #define mmap heap_mmap
