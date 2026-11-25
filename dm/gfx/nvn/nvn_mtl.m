@@ -24041,15 +24041,24 @@ static ui_take_t fg_ui_take(id<MTL4CommandBuffer> cb, int k, const tex_t *t, con
 }
 
 // The mask's coverage of the picture, read once the snapshot's command buffer has run (its commit's feedback: no wait on the CPU, which would hold the game's
-// queue for the frame's own work). Logged every frame the mask ran; past FG_UI_BLANK the frames are shown as drawn, as in the game's menus, and the next one
-// with a picture left to interpolate turns generation back on.
+// queue for the frame's own work). Logged on state/target/size changes and every 300 frames so steady gameplay does not flood the log; past FG_UI_BLANK the frames
+// are shown as drawn, as in the game's menus, and the next one with a picture left to interpolate turns generation back on.
 static void fg_ui_report(int k, ui_take_t u) {
     if (!g_fg_ui_stat) return;
     float c = ((float *)g_fg_ui_stat.contents)[k];
     int blank = u.use && c > FG_UI_BLANK;
-    MLOG("frame generation: UI mask frame %llu: %s, %dx%d, target %llu, %.1f %% of the picture covered, %d copies this frame%s", (unsigned long long)u.frame,
-         u.use ? "the game's UI pass" : "none", u.w, u.h, (unsigned long long)u.serial, 100 * (double)c, u.copies,
-         blank ? " (no part left to interpolate: the frame is shown as drawn)" : "");
+    static os_unfair_lock mu = OS_UNFAIR_LOCK_INIT;
+    static int seen, prev_use, prev_w, prev_h, prev_blank;
+    static uint64_t prev_serial, n;
+    os_unfair_lock_lock(&mu);
+    int changed = !seen || u.use != prev_use || u.w != prev_w || u.h != prev_h || u.serial != prev_serial || blank != prev_blank;
+    int periodic = !(n++ % 300);
+    if (changed) { seen = 1; prev_use = u.use; prev_w = u.w; prev_h = u.h; prev_serial = u.serial; prev_blank = blank; }
+    os_unfair_lock_unlock(&mu);
+    if (changed || periodic)
+        MLOG("frame generation: UI mask frame %llu: %s, %dx%d, target %llu, %.1f %% of the picture covered, %d copies this frame%s", (unsigned long long)u.frame,
+             u.use ? "the game's UI pass" : "none", u.w, u.h, (unsigned long long)u.serial, 100 * (double)c, u.copies,
+             blank ? " (no part left to interpolate: the frame is shown as drawn)" : "");
     if (blank != atomic_load(&g_fg_ui_blank)) {
         atomic_store(&g_fg_ui_blank, blank);
         MLOG("frame generation: %s", blank ? "the UI covers the picture: frames are shown as drawn, as in the game's menus, until it does not (DM_FRAMEGEN_UI)"
