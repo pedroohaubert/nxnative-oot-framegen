@@ -12199,6 +12199,7 @@ static int ga_rmtree_fd(int fd, int depth) {
     DIR *dp = fdopendir(fd);
     if (!dp) { close(fd); return 0; }
     int dfd = dirfd(dp), ok = 1;
+    if (dfd < 0) { closedir(dp); return 0; }
     for (;;) {
         int saw = 0, unlinked = 0;
         struct dirent *de;

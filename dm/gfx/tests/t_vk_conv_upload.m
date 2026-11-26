@@ -76,6 +76,7 @@ int main(void) {
 
         void *mapped = NULL;
         CHECK(h_vkMapMemory(dev, mem, 0, im->size, 0, &mapped) == VK_SUCCESS && mapped, "R4G4 memory mapped");
+        if (!mapped) abort();
         memset(mapped, 0xA5, im->size);
 
         submit_empty();

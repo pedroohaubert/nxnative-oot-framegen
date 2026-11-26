@@ -54,6 +54,7 @@ int main(void) { @autoreleasepool {
 
     // Recoverable unsignaled submission: hold the queue behind a gate so feedback cannot run before g_ev is restored, redirect rec_signal to a decoy event, then release.
     id<MTLSharedEvent> gate = [g_dev newSharedEvent], decoy = [g_dev newSharedEvent], real_ev = g_ev;
+    if (!gate || !decoy) abort();
     rec_queue_block(^{ [g_q4 waitForEvent:gate value:1]; });
     mtl_sub_begin();
     g_ev = decoy;

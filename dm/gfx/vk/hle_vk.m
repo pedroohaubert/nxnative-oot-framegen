@@ -807,7 +807,7 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
 // swap chain, as the console's driver lets it: ignored, or the swap chain would go on using freed memory
 VKB(vkDestroyImage, void, VkDevice d, VkImage im, const VkAllocationCallbacks *a) { (void)d; (void)a; if (im && im->swap) return; if (im) { if (im->shadow) conv_remove(im); im->tex = nil; free(im->shadow); free(im); } }
 VK(vkGetImageMemoryRequirements, void, VkDevice d, VkImage im, VkMemoryRequirements *r) {
-    (void)d; r->alignment = 4096; r->size = (im->size + 4095) & ~4095ull; r->memoryTypeBits = 7;
+    (void)d; r->alignment = 4096; r->size = im ? (im->size + 4095) & ~4095ull : 0; r->memoryTypeBits = 7;
 }
 VK(vkGetImageMemoryRequirements2, void, VkDevice d, const VkImageMemoryRequirementsInfo2 *i, VkMemoryRequirements2 *r) {
     h_vkGetImageMemoryRequirements(d, i->image, &r->memoryRequirements); dedicated_req(r->pNext);

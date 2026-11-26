@@ -434,7 +434,7 @@ static void fire_hotplug(TestUSBNode *node, int dc, int ds, int dp) {
     }
 }
 
-static TestUSBPipe *pad_in_pipe(gip_pad *d) { return (__bridge TestUSBPipe *)d->in; }
+static TestUSBPipe *pad_in_pipe(gip_pad *d) { return d ? (__bridge TestUSBPipe *)d->in : nil; }
 static TestUSBPipe *pad_out_pipe(gip_pad *d) { return (__bridge TestUSBPipe *)d->out; }
 static TestUSBDevice *pad_dev(gip_pad *d) { return (__bridge TestUSBDevice *)d->dev; }
 
