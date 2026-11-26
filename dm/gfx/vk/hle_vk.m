@@ -821,7 +821,7 @@ VK(vkGetImageSubresourceLayout, void, VkDevice d, VkImage im, const VkImageSubre
     l->arrayPitch = l->depthPitch * dd; l->size = l->arrayPitch; l->offset = off + l->arrayPitch * sr->arrayLayer;
 }
 VKB(vkBindImageMemory, VkResult, VkDevice d, VkImage im, VkDeviceMemory m, VkDeviceSize off) {   // other images keep their own storage
-    (void)d; if (!im->pitch) return VK_SUCCESS;
+    (void)d; if (!im || !im->pitch) return VK_SUCCESS;
     id<MTLBuffer> b = mem_buf(m); if (!b) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     if (im->f->conv) {   // a texture of its own, unpacked from the memory before each submit that follows a change (conv_sync)
         @autoreleasepool {

@@ -66,11 +66,13 @@ int main(void) {
         };
         VkImage im = NULL;
         CHECK(h_vkCreateImage(dev, &ici, NULL, &im) == VK_SUCCESS && im, "R4G4 linear image created");
+        if (!im) abort();
         VkMemoryRequirements mr = {0};
         h_vkGetImageMemoryRequirements(dev, im, &mr);
         VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = 1};
         VkDeviceMemory mem = NULL;
         CHECK(h_vkAllocateMemory(dev, &mai, NULL, &mem) == VK_SUCCESS && mem, "R4G4 memory allocated");
+        if (!mem) abort();
         CHECK(h_vkBindImageMemory(dev, im, mem, 0) == VK_SUCCESS && im->tex, "R4G4 image bound");
         CHECK(im->conv_synced == 0, "R4G4 starts unsynced before first submit");
 
@@ -109,13 +111,16 @@ int main(void) {
         ici.format = VK_FORMAT_B4G4R4A4_UNORM_PACK16;
         VkImage im16 = NULL;
         CHECK(h_vkCreateImage(dev, &ici, NULL, &im16) == VK_SUCCESS && im16, "B4G4R4A4 linear image created");
+        if (!im16) abort();
         h_vkGetImageMemoryRequirements(dev, im16, &mr);
         mai.allocationSize = mr.size;
         VkDeviceMemory mem16 = NULL;
         CHECK(h_vkAllocateMemory(dev, &mai, NULL, &mem16) == VK_SUCCESS && mem16, "B4G4R4A4 memory allocated");
+        if (!mem16) abort();
         CHECK(h_vkBindImageMemory(dev, im16, mem16, 0) == VK_SUCCESS && im16->tex, "B4G4R4A4 image bound");
         void *mapped16 = NULL;
         CHECK(h_vkMapMemory(dev, mem16, 0, im16->size, 0, &mapped16) == VK_SUCCESS && mapped16, "B4G4R4A4 memory mapped");
+        if (!mapped16) abort();
         memset(mapped16, 0xA5, im16->size);
 
         submit_empty();
