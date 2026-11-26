@@ -189,7 +189,7 @@ private struct TactilePalette {
 
 private enum TactileMetrics {
     static let windowWidth: CGFloat = 520
-    static let windowHeight: CGFloat = 548
+    static let windowHeight: CGFloat = 564
     static let minWidth: CGFloat = 480
     static let minHeight: CGFloat = 480
     static let cardRadius: CGFloat = 10
@@ -345,6 +345,26 @@ private struct TactileCheckbox: View {
     }
 }
 
+private struct SegmentShape: InsettableShape {
+    let pill: Bool
+    let radius: CGFloat
+    var insetAmount: CGFloat = 0
+
+    func inset(by amount: CGFloat) -> SegmentShape {
+        var copy = self
+        copy.insetAmount += amount
+        return copy
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let insetRect = rect.insetBy(dx: insetAmount, dy: insetAmount)
+        if pill {
+            return Capsule(style: .circular).path(in: insetRect)
+        }
+        return RoundedRectangle(cornerRadius: max(radius - insetAmount, 0), style: .continuous).path(in: insetRect)
+    }
+}
+
 private struct TactilePillSegment<T: Hashable>: View {
     let items: [(T, String)]
     @Binding var selection: T
@@ -365,8 +385,8 @@ private struct TactilePillSegment<T: Hashable>: View {
         let p = TactilePalette(scheme)
         let inset: CGFloat = 3
         let itemHeight: CGFloat = pillShape ? 26 : 24
-        let trackRadius: CGFloat = pillShape ? 999 : 7
-        let itemRadius: CGFloat = pillShape ? 999 : 5
+        let trackShape = SegmentShape(pill: pillShape, radius: 7)
+        let itemShape = SegmentShape(pill: pillShape, radius: 5)
 
         HStack(spacing: 2) {
             ForEach(items, id: \.0) { value, label in
@@ -388,10 +408,10 @@ private struct TactilePillSegment<T: Hashable>: View {
                         .frame(height: itemHeight)
                         .background {
                             if active {
-                                RoundedRectangle(cornerRadius: itemRadius, style: .continuous)
+                                itemShape
                                     .fill(p.controlFill)
                                     .overlay {
-                                        RoundedRectangle(cornerRadius: itemRadius, style: .continuous)
+                                        itemShape
                                             .strokeBorder(p.controlRing, lineWidth: p.ringWidth)
                                     }
                                     .shadow(
@@ -410,8 +430,8 @@ private struct TactilePillSegment<T: Hashable>: View {
             }
         }
         .padding(inset)
-        .background(p.well, in: RoundedRectangle(cornerRadius: trackRadius, style: .continuous))
-        .clipShape(RoundedRectangle(cornerRadius: trackRadius, style: .continuous))
+        .background(p.well, in: trackShape)
+        .clipShape(trackShape)
         .opacity(enabled ? 1.0 : 0.55)
     }
 }
@@ -801,14 +821,14 @@ struct LauncherView: View {
         return VStack(spacing: 0) {
             ForEach(Array(rows.enumerated()), id: \.element.env) { index, setting in
                 TactileSettingRow(s: setting, m: m, showDescription: false)
-                    .padding(.vertical, 12)
+                    .padding(.vertical, 11)
                 if index < rows.count - 1 {
                     Rectangle().fill(p.line).frame(height: TactileMetrics.hairline)
                 }
             }
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
     }
 
     private func advancedBody(_ p: TactilePalette) -> some View {

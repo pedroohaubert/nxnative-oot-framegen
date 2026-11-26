@@ -6,7 +6,7 @@ func checkLauncherLayout(_ model: LauncherModel, defaults: UserDefaults) -> Int 
     NSApplication.shared.setActivationPolicy(.prohibited)
     var failed = 0
     func expect(_ c: Bool, _ what: String) { print((c ? "PASS " : "FAIL ") + what); if !c { failed += 1 } }
-    for size in [NSSize(width: 480, height: 480), NSSize(width: 520, height: 548)] {
+    for size in [NSSize(width: 480, height: 480), NSSize(width: 520, height: 564)] {
         for tab in [LauncherTab.essentials, LauncherTab.advanced] {
             autoreleasepool {
                 let view = NSHostingView(rootView: LauncherView(m: model, done: { _ in }, initialTab: tab).defaultAppStorage(defaults))
