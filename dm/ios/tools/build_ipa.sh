@@ -90,6 +90,9 @@ else [ -n "$V" ] && lib_has "$MSL_IOS/b-$V" || die "no iOS shader libraries $MSL
   printf '%s\n' "$STAMP" | grep -qxF "$(printf 'game\t%s' "$GAME")" && printf '%s\n' "$STAMP" | grep -qxF "$(printf 'inputs\t%s' "$IN")" ||
     die "the iOS shader libraries $MSL_IOS/b-$V are not a full build from this profile's current tables (inputs $IN; their stamp: $([ -n "$STAMP" ] && printf '%s\n' "$STAMP" | grep -v '^#' | tr '\n\t' '  ' || echo none)): build them again (IOSOUT=$MSL_IOS dmsh_build.py ...)"
   head -1 "$GD/c1_full.tsv" 2> /dev/null | grep -Eq "^# chain b-$V inputs $IN( |$)" || die "$GD/c1_full.tsv is missing or not made from these libraries (chain $V, inputs $IN): a full dmsh_build.py run makes it and cb_extent.tsv"; fi
+if [ "$GFXAPI" = nvn ] && [ -s "$GD/gl_capture.tsv" ]; then
+  [ -f "$MSL_IOS/gl/gl_shaders.metallib" ] && [ -f "$MSL_IOS/gl/gl_shaders.tsv" ] || die "no supplemental GL shader library and table at $MSL_IOS/gl"
+fi
 }
 check_program
 P0=$GAME; P0_PATCHED=$PATCHED; P0_ROMFS=$ROMFS; P0_MSL=$MSL_IOS; P0_GFX=$GFXAPI
@@ -288,6 +291,7 @@ if [ -n "${PROGRAMS_TSV:-}" ]; then   # each program's shader libraries, RomFS, 
   while IFS= read -r row; do prog_set "$row"; SKIP+=(--skip "$P/p$PN")
     if [ -f "$ROMFS" ]; then MAPS+=("$P/p$PN/romfs.img=$ROMFS"); else MAPS+=("$P/p$PN/romfs=$ROMFS"); fi
     MAPS+=("$P/msl/p$PN/$MSLDIR=$MSL_IOS/$MSLDIR")
+    if [ "$GFXAPI" = nvn ] && [ -s "$GD/gl_capture.tsv" ]; then MAPS+=("$P/msl/p$PN/gl=$MSL_IOS/gl"); fi
     if [ -d "$(dirname "$ROMFS")/html" ]; then MAPS+=("$P/p$PN/html=$(dirname "$ROMFS")/html"); fi
     if [ -d "$(dirname "$ROMFS")/jit" ]; then MAPS+=("$P/p$PN/jit=$(dirname "$ROMFS")/jit"); t "program $PN: nn::jit image $(dirname "$ROMFS")/jit"; fi   # beside its RomFS (loader.c dm_jit_serve_dir)
     if [ -d "$(dirname "$ROMFS")/romfs_programs" ]; then MAPS+=("$P/p$PN/romfs_programs=$(dirname "$ROMFS")/romfs_programs"); fi   # the other programs' RomFS (hle_fs.c MountRom by program index)
@@ -306,6 +310,7 @@ elif [ -f "$ROMFS" ]; then MAPS=("$P/romfs.img=$ROMFS"); else MAPS=("$P/romfs=$R
 if [ -n "$AOC" ] && [ -d "$AOC" ]; then MAPS+=("$P/aoc=$AOC"); t "add-on content: $(ls "$AOC" | tr '\n' ' ')"; fi
 if [ -n "${PSO:-}" ]; then MAPS+=("$P/pso=$PSO"); fi
 MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "$P=$APP")
+if [ "${GFXAPI:-}" = nvn ] && [ -n "${GD:-}" ] && [ -s "$GD/gl_capture.tsv" ]; then MAPS+=("$P/msl/gl=$MSL_IOS/gl"); fi
 # Amiibo (a profile with amiibo.tsv: Ocarina of Time's in-game Amiibo menu, GameMenu.swift): the app's romfs_overlay holds that list and, with the profile's amiibo_overlay on, the
 # game's own Game/AmiiboSetting with every amiibo's daily limit off, made here from the player's RomFS image (scripts/oot_amiibo_overlay.py; nothing of the game is in the repository).
 # main.m serves it over the RomFS (DM_ROMFS_OVERLAY, hle_fs.c rom_overlay_expand) and points DM_AMIIBO at Documents/amiibo.txt. A folder of its own, so no other replacement is packed

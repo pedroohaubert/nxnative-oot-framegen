@@ -12,7 +12,7 @@ QUIET = $(if $(findstring -fsanitize,$(SAN)),,2>/dev/null)
 GINC = $(if $(strip $(GAME)),-I../gen/$(GAME) -I../../games/$(GAME),$(error GAME is not set: make GAME=<base game title ID>: $(shell python3 ../../games/game.py list | awk -F'\t' '{printf "%s (%s)  ", $$1, $$3}')))
 $(B)/t_fs $(B)/t_fs_case $(B)/t_fs_commit_list $(B)/t_fs_commit_list_tsan: ../romfs_image.h
 GAME_H = ../gen/$(GAME)/game_profile.h
-run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_friends $(B)/t_fs $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_crash_diag $(B)/t_condvar $(B)/t_condvar_old $(B)/t_dump_live $(B)/t_pollwait $(B)/t_clockwait $(B)/t_pause $(B)/t_pause_stress $(B)/t_pctl $(B)/t_sf $(B)/t_audren_sv $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid $(B)/t_switch2 $(B)/t_input_stream $(B)/t_mic_level $(B)/t_amiibo
+run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_friends $(B)/t_fs $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_crash_diag $(B)/t_memstat $(B)/t_condvar $(B)/t_condvar_old $(B)/t_dump_live $(B)/t_pollwait $(B)/t_clockwait $(B)/t_pause $(B)/t_pause_stress $(B)/t_pctl $(B)/t_sf $(B)/t_audren_sv $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid $(B)/t_switch2 $(B)/t_input_stream $(B)/t_mic_level $(B)/t_amiibo
 	$(B)/t_language
 	$(B)/t_heap_size
 	$(B)/t_touch
@@ -27,6 +27,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
 	TMPDIR="$(abspath $(B))" $(B)/t_mii_sysdata $(QUIET)
 	TMPDIR="$(abspath $(B))" $(B)/t_save_sync $(QUIET)
 	TMPDIR="$(abspath $(B))" $(B)/t_save_sync_metadata $(QUIET)
+	TMPDIR="$(abspath $(B))" $(B)/t_save_sync_apple $(QUIET)
 	$(B)/t_audio
 	$(B)/t_output_stream
 	$(B)/t_mii
@@ -40,6 +41,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
 	$(B)/t_swkbd
 	$(B)/t_altstack
 	$(B)/t_crash_diag
+	TMPDIR="$(abspath $(B))" $(B)/t_memstat
 	$(B)/t_bigstack
 	$(B)/t_condvar
 	$(B)/t_dump_live
@@ -67,6 +69,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
 	$(B)/t_movie_avc
 	$(B)/t_nv
 	$(B)/t_objmap
+	$(B)/t_stack_alloc
 	$(B)/t_vi_history $(QUIET)
 	$(B)/t_nfc
 	$(B)/t_motion
@@ -83,7 +86,9 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
 	TMPDIR="$(abspath $(B))" $(B)/t_hid
 	$(B)/t_pad_hid
 	$(B)/t_pad_gip
+	$(B)/t_pad_xusb
 	$(B)/t_pad_hid_mac
+	$(B)/t_pad_gip_mac
 	$(B)/t_pad_pro
 	$(B)/t_switch2
 	$(B)/t_haptics
@@ -92,6 +97,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
 	$(B)/t_mic_level
 	$(B)/t_amiibo
 	$(B)/t_front_role
+	$(B)/t_front_present
 	TMPDIR="$(abspath $(B))" $(B)/t_mods
 	TMPDIR="$(abspath $(B))" $(B)/t_cheats $(QUIET)
 	$(B)/t_nro
@@ -200,15 +206,18 @@ $(B)/t_mii_sysdata: t_mii_sysdata.c ../hle_fs.c ../hle_account_users.c ../accoun
 	$(CLANG) -O1 -Wall -Wno-unused-function -I.. $(GINC) -o $@ t_mii_sysdata.c ../hle_bigstack.c ../save_sync.c ../hle_account_users.c -lz
 $(B)/t_fs_case: t_fs_case.c ../hle_fs.c ../hle_account_users.c ../account_users.h ../save_sync.c ../save_sync.h ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_fs_case.c ../hle_bigstack.c ../save_sync.c ../hle_account_users.c
-run: $(B)/t_save_sync $(B)/t_save_sync_metadata
+run: $(B)/t_save_sync $(B)/t_save_sync_metadata $(B)/t_save_sync_apple
 $(B)/t_save_sync: t_save_sync.c t_fs_stub.c ../hle_fs.c ../hle_account_users.c ../account_users.h ../save_sync.c ../save_sync.h ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wall -Wno-unused-function -I.. $(GINC) -o $@ t_save_sync.c t_fs_stub.c ../hle_bigstack.c ../save_sync.c ../hle_account_users.c
 $(B)/t_save_sync_metadata: t_save_sync_metadata.c ../save_sync.c ../save_sync.h | $(B)
 	$(CLANG) -O1 -Wall -Wno-unused-function -I.. -o $@ t_save_sync_metadata.c
+$(B)/t_save_sync_apple: t_save_sync_apple.m ../save_sync.c ../save_sync_apple.m ../save_sync.h | $(B)
+	$(CLANG) -O1 -fobjc-arc -Wall -Werror -Wno-unused-function -I.. -o $@ t_save_sync_apple.m ../save_sync.c ../save_sync_apple.m -framework Foundation
 .PHONY: save-sync
-save-sync: $(B)/t_save_sync $(B)/t_save_sync_metadata
+save-sync: $(B)/t_save_sync $(B)/t_save_sync_metadata $(B)/t_save_sync_apple
 	TMPDIR="$(abspath $(B))" $(B)/t_save_sync $(QUIET)
 	TMPDIR="$(abspath $(B))" $(B)/t_save_sync_metadata $(QUIET)
+	TMPDIR="$(abspath $(B))" $(B)/t_save_sync_apple $(QUIET)
 # hle_audio.c's input streams reach the microphone through weak dm_mic_* defaults, so these tests need no stub
 AUDIO_INPUT_STUB =
 AUDIO_INPUT_DEPS =
@@ -239,6 +248,12 @@ audio-device: $(B)/t_audio_device
 run: audio-device
 $(B)/t_audio_spsc_tsan: t_audio_spsc.c ../hle_audio.c $(AUDIO_INPUT_DEPS) ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -O1 -fsanitize=thread -Wno-unused-function -I.. $(GINC) -o $@ t_audio_spsc.c ../hle_bigstack.c $(AUDIO_INPUT_STUB) -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
+$(B)/t_dualsense_mic: t_dualsense_mic.c ../dualsense_mic_mac.c ../dualsense_mic.h | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -I.. -o $@ t_dualsense_mic.c ../dualsense_mic_mac.c
+.PHONY: dualsense-mic
+dualsense-mic: $(B)/t_dualsense_mic
+	$(B)/t_dualsense_mic
+run: dualsense-mic
 run: $(B)/t_fpslock
 $(B)/t_fpslock: t_fpslock.c ../hle_fpslock.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wno-unused-function $(GINC) -o $@ t_fpslock.c
@@ -251,12 +266,16 @@ $(B)/t_uecvar: t_uecvar.c ../hle_uecvar.c ../hle.h ../dm.h $(GAME_H) | $(B)
 $(B)/t_swkbd: t_swkbd.c ../hle_swkbd.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_swkbd.c ../hle_swkbd.c
 run: $(B)/t_bigstack
-run: web-stack
-.PHONY: web-stack
+run: web-stack web-apple
+.PHONY: web-stack web-apple
 web-stack: $(B)/t_web_stack
 	$(B)/t_web_stack
 $(B)/t_web_stack: t_web_stack.c ../hle_web.c ../hle_bigstack.c ../hle.h ../dm.h ../front.h ../dm_input.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_web_stack.c ../hle_bigstack.c
+web-apple: $(B)/t_web_apple
+	$(B)/t_web_apple
+$(B)/t_web_apple: t_web_apple.m ../web_apple.m ../dm.h ../dm_input.h ../front.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -fobjc-arc -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_web_apple.m -framework Cocoa -framework WebKit -framework JavaScriptCore
 $(B)/t_bigstack: t_bigstack.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wall -Wno-unused-function -I.. $(GINC) -o $@ t_bigstack.c ../hle_bigstack.c
 run: watch-sample
@@ -269,6 +288,8 @@ $(B)/t_altstack: t_altstack.c t_altstack_stub.c ../crash.c ../dm.h $(GAME_H) | $
 	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_altstack.c t_altstack_stub.c ../crash.c
 $(B)/t_crash_diag: t_crash_diag.m t_altstack_stub.c ../crash.c ../memstat.m ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -fobjc-arc -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_crash_diag.m t_altstack_stub.c ../crash.c ../memstat.m -framework Foundation -framework Metal
+$(B)/t_memstat: t_memstat.m ../memstat.m ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -fobjc-arc -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_memstat.m ../memstat.m -framework Foundation -framework Metal
 $(B)/t_net_eventfd: t_net_eventfd.c ../hle_net.c ../hle_net.h ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function $(if $(findstring -fsanitize,$(SAN)),,-fsanitize=address,undefined) -I.. $(GINC) -o $@ t_net_eventfd.c
 run: $(B)/t_net_loopback
@@ -294,6 +315,9 @@ $(B)/t_nv: t_nv.c ../../gfx/hle_nv.c ../hle.h ../dm.h $(GAME_H) | $(B)
 run: $(B)/t_objmap
 $(B)/t_objmap: t_objmap.c ../hle_os.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_objmap.c
+run: $(B)/t_stack_alloc
+$(B)/t_stack_alloc: t_stack_alloc.c ../hle_stack_alloc.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_stack_alloc.c ../hle_bigstack.c
 # nn::nfc answered without nfc:user (NFC disabled), beside the nfp no-tag answers
 run: $(B)/t_nfc
 $(B)/t_nfc: t_nfc.c ../hle_sdk16.c ../amiibo.h ../hle.h ../dm.h $(GAME_H) | $(B)
@@ -345,6 +369,10 @@ $(B)/t_hid_tsan: t_hid.c ../hle_hid.c ../motion_fusion.h ../hle_haptics.c ../hle
 run: $(B)/t_front_role
 $(B)/t_front_role: t_front_role.c ../front_role.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -I.. -o $@ t_front_role.c
+# Mac presentation layer opacity policy (mirrored fullscreen workaround, issue #1821).
+run: $(B)/t_front_present
+$(B)/t_front_present: t_front_present.c ../front_mac_present.h | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -I.. -o $@ t_front_present.c
 $(B)/t_haptics: t_haptics.c ../hle_haptics.c ../hle_haptics.h ../dm_input.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -I.. -o $@ t_haptics.c ../hle_haptics.c
 $(B)/t_amiibo: t_amiibo.c ../amiibo.h | $(B)
@@ -374,6 +402,18 @@ $(B)/t_pollwait: t_pollwait.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_pollwait.c t_condvar_stub.c
 $(B)/t_clockwait: t_clockwait.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_clockwait.c t_condvar_stub.c
+$(B)/t_scheduler_config: t_scheduler_config.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_scheduler_config.c t_condvar_stub.c
+.PHONY: scheduler-config scheduler-config-tsan
+scheduler-config: $(B)/t_scheduler_config
+	$(B)/t_scheduler_config default
+	$(B)/t_scheduler_config custom
+	$(B)/t_scheduler_config off
+	$(B)/t_scheduler_config empty
+scheduler-config-tsan:
+	$(MAKE) B=$(B)/scheduler-tsan SAN="$(TSAN_FLAGS)" scheduler-config
+run: scheduler-config
+tsan-threads-run: scheduler-config
 $(B)/t_preempt: t_preempt.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_preempt.c t_condvar_stub.c
 # the pause tests supply module_of (the stub's reports no guest code) through DM_TEST_MODULE_OF
@@ -500,7 +540,7 @@ include ../../sanitizers/sanitizers.mk
 asan:
 	@$(call san_fresh,$(B)/asan,$(ASAN_FLAGS))
 	$(ASAN_ENV) $(MAKE) B=$(B)/asan SAN="$(ASAN_FLAGS)" run
-TSAN_T = t_audio t_audio_stats t_audio_device t_thread_leak t_oe t_fs_commit_list t_fs_case t_save_sync t_condvar t_condvar_old t_preempt t_system_event t_notify_sched t_handoff_wait t_altstack t_sync_wait
+TSAN_T = t_audio t_audio_stats t_audio_device t_thread_leak t_oe t_fs_commit_list t_fs_case t_save_sync t_condvar t_condvar_old t_preempt t_system_event t_notify_sched t_handoff_wait t_altstack t_sync_wait t_ue_heap_span
 TSAN_T += t_net_eventfd t_net_loopback t_account
 tsan-threads:
 	@$(call san_fresh,$(B)/tsan,$(TSAN_FLAGS))
@@ -528,13 +568,18 @@ tsan-threads-run: $(addprefix $(B)/,$(TSAN_T))
 	$(B)/t_handoff_wait --all-peers
 	$(B)/t_altstack
 	$(B)/t_sync_wait
+	$(B)/t_ue_heap_span
 	DM_QOS_MAP=1 $(B)/t_notify_sched
 	DM_QOS_MAP=1 $(B)/t_notify_sched --all-peers
 $(B)/t_pad_hid: t_pad_hid.c ../pad_hid.h ../dm_input.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_pad_hid.c
-run: $(B)/t_pad_gip
+run: $(B)/t_pad_gip $(B)/t_pad_xusb $(B)/t_pad_gip_mac
 $(B)/t_pad_gip: t_pad_gip.c ../pad_gip.h ../pad_hid.h ../dm_input.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_pad_gip.c
+$(B)/t_pad_xusb: t_pad_xusb.c ../pad_xusb.h ../pad_hid.h ../dm_input.h | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_pad_xusb.c
+$(B)/t_pad_gip_mac: t_pad_gip_mac.m ../pad_gip_mac.h ../pad_gip.h ../pad_xusb.h ../pad_hid.h ../pad_slots.h ../dm_input.h | $(B)
+	$(CLANG) -O1 -g -fobjc-arc -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_pad_gip_mac.m -framework Foundation -framework IOKit -framework IOUSBHost
 run: $(B)/t_pad_pro
 $(B)/t_pad_pro: t_pad_pro.c ../pad_pro.h ../dm_input.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_pad_pro.c

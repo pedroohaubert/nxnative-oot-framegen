@@ -308,7 +308,7 @@ struct VkBuffer_T { VkDeviceSize size; VkBufferUsageFlags usage; VkDeviceMemory 
 struct VkBufferView_T { VkBuffer buf; const fmt_t *f; VkDeviceSize off, range; __strong id<MTLTexture> tex; };
 struct VkImage_T { __strong id<MTLTexture> tex; const fmt_t *f; VkFormat fmt; VkImageType type; uint32_t w, h, d, mips, layers, samples; VkDeviceSize size; uint64_t serial;
                   VkImageUsageFlags usage; uint32_t pitch;   // pitch: row pitch of a linear image (its texture is made over the bound memory), 0 otherwise
-                  VkDeviceMemory cmem; VkDeviceSize coff; uint8_t *shadow;   // a linear image of a converted format (fmt_t.conv): its memory, and the texels last unpacked
+                  VkDeviceMemory cmem; VkDeviceSize coff; uint8_t *shadow; uint8_t conv_synced;   // a linear image of a converted format (fmt_t.conv): its memory, last unpacked bytes, and whether the first upload completed
                   int swap; };   // one of a swap chain's images: the swap chain owns it
 struct VkImageView_T { __strong id<MTLTexture> tex; VkImage img; };
 struct VkSampler_T { __strong id<MTLSamplerState> s; __strong VkSamplerMetal *ref; };
@@ -744,13 +744,14 @@ static void conv_sync(void) {
     for (size_t i = 0; i < g_nconv; i++) {
         VkImage im = g_conv[i]; id<MTLBuffer> b = mem_buf(im->cmem); if (!b || !im->tex) continue;
         const uint8_t *src = (const uint8_t *)b.contents + im->coff;
-        if (!memcmp(src, im->shadow, im->size)) continue;
-        memcpy(im->shadow, src, im->size);
+        if (im->conv_synced && !memcmp(src, im->shadow, im->size)) continue;
         uint32_t ob = im->f->conv == CV_R4G4 ? 2 : 4; size_t need = (size_t)im->w * im->h * ob;
         if (!need) continue;
+        memcpy(im->shadow, src, im->size);
         if (need > tcap) { uint8_t *n = realloc(tmp, need); if (!n) die("[vk] out of memory %zu", need); tmp = n; tcap = need; }
         conv_unpack(im, im->shadow, tmp);
         [im->tex replaceRegion:MTLRegionMake2D(0, 0, im->w, im->h) mipmapLevel:0 withBytes:tmp bytesPerRow:(NSUInteger)im->w * ob];
+        im->conv_synced = 1;
     }
     pthread_mutex_unlock(&g_convmu);
 }
@@ -806,7 +807,7 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
 // swap chain, as the console's driver lets it: ignored, or the swap chain would go on using freed memory
 VKB(vkDestroyImage, void, VkDevice d, VkImage im, const VkAllocationCallbacks *a) { (void)d; (void)a; if (im && im->swap) return; if (im) { if (im->shadow) conv_remove(im); im->tex = nil; free(im->shadow); free(im); } }
 VK(vkGetImageMemoryRequirements, void, VkDevice d, VkImage im, VkMemoryRequirements *r) {
-    (void)d; r->alignment = 4096; r->size = (im->size + 4095) & ~4095ull; r->memoryTypeBits = 7;
+    (void)d; r->alignment = 4096; r->size = im ? (im->size + 4095) & ~4095ull : 0; r->memoryTypeBits = 7;
 }
 VK(vkGetImageMemoryRequirements2, void, VkDevice d, const VkImageMemoryRequirementsInfo2 *i, VkMemoryRequirements2 *r) {
     h_vkGetImageMemoryRequirements(d, i->image, &r->memoryRequirements); dedicated_req(r->pNext);
@@ -820,17 +821,17 @@ VK(vkGetImageSubresourceLayout, void, VkDevice d, VkImage im, const VkImageSubre
     l->arrayPitch = l->depthPitch * dd; l->size = l->arrayPitch; l->offset = off + l->arrayPitch * sr->arrayLayer;
 }
 VKB(vkBindImageMemory, VkResult, VkDevice d, VkImage im, VkDeviceMemory m, VkDeviceSize off) {   // other images keep their own storage
-    (void)d; if (!im->pitch) return VK_SUCCESS;
+    (void)d; if (!im || !im->pitch) return VK_SUCCESS;
     id<MTLBuffer> b = mem_buf(m); if (!b) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     if (im->f->conv) {   // a texture of its own, unpacked from the memory before each submit that follows a change (conv_sync)
         @autoreleasepool {
             MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:im->f->pf width:im->w height:im->h mipmapped:NO];
             td.storageMode = MTLStorageModeShared; td.usage = MTLTextureUsageShaderRead; im->tex = [g_dev newTextureWithDescriptor:td];
         }
-        im->cmem = m; im->coff = off; im->shadow = calloc(1, im->size);
-        memset(im->shadow, 0xA5, im->size);   // differs from anything the game wrote, so the first submit unpacks it
+        if (!im->tex) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        im->cmem = m; im->coff = off; im->shadow = zalloc(im->size); im->conv_synced = 0;
         conv_add(im);
-        return im->tex ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        return VK_SUCCESS;
     }
     @autoreleasepool {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:im->f->pf width:im->w height:im->h mipmapped:NO];

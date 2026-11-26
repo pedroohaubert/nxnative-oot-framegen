@@ -10,7 +10,6 @@
 static int heap_mprotect(void *addr, size_t size, int prot);
 static void *heap_mmap(void *addr, size_t size, int prot, int flags, int fd, off_t offset);
 static _Noreturn void heap_abort(void);
-int dm_sdk_ounce(void) { return 0; }
 // Substitution is confined to this translation unit; production needs no test API.
 #define mprotect heap_mprotect
 #define mmap heap_mmap
@@ -26,6 +25,7 @@ int dm_sdk_ounce(void) { return 0; }
 module_t *g_mod;
 int g_nmod;
 struct dm_flags g_flag;
+int dm_sdk_ounce(void) { return 0; }   // No SDK module is loaded in this fixture.
 void hlecount_svc(int num) { (void)num; }
 int svc_thread(int num, uint64_t *regs) { (void)num; (void)regs; return 0; }
 const hle_readonly_shmem *hle_get_readonly_shmem(uint32_t handle) { (void)handle; return NULL; }

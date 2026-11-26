@@ -424,10 +424,7 @@ static void gcp_count(NvProg *pr, int why) {
 }
 static NSMutableDictionary *g_geo_mesh_runfn;   // a mesh entry → its run twin (dm_mesh_run..., dmsh_mesh.py), or NSNull: none in the library, or its pipeline failed
 // Generated mesh entries inherit the vertex library's constants. Keep their descriptors so fn_dev and fn_dev_b can materialize the defaults or the specialization without the border corrections, as for shader_load.
-static id<MTLFunction> geo_mesh_entry(id<MTLLibrary> lib, NSString *name) {
-    id<MTLFunction> f = [lib newFunctionWithName:name];
-    return f.functionConstantsDictionary.count ? fn_spec(lib, name, [MTLFunctionConstantValues new], NULL) : fn4_note(f, lib, name, nil);
-}
+static id<MTLFunction> geo_mesh_entry(id<MTLLibrary> lib, NSString *name) { return fn_load(lib, name, NULL); }
 // The mesh entry for this draw's program, or nil (the compute path draws it)
 static id<MTLFunction> geo_mesh_fn(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     if (!geo_mesh_on()) { g_geo_why = GCP_OFF; return nil; }
@@ -627,7 +624,12 @@ static id<MTLFunction> mtk_nop_fragment(void) {
         fn = fn4_note([l newFunctionWithName:@"dm_mesh_nop"], l, @"dm_mesh_nop", nil); if (!fn) MLOG("[RED] the empty fragment function did not compile: %s", e.localizedDescription.UTF8String); });
     return fn;
 }
-// The Metal 4 descriptor of a native mesh pipeline, whole: no base with open colour state, as a game has some hundred of them, each with functions of its own. Its depth / stencil
+// The Metal 4 descriptor of a native mesh pipeline, whole: never specialized from an unspecialized base. Apple's Metal 4 compiler/driver
+// (newRenderPipelineStateBySpecializationWithDescriptor:pipeline: on MTL4MeshRenderPipelineDescriptor) drops mesh pipeline state on the specialized
+// AGX pipeline (maxTotalThreadgroupsPerMeshGrid = 0 and imageblockSampleLength = 0 on Mac16,7 M4 Pro / macOS 27.2.1 / Metal 32023.922, even when set
+// explicitly), non-deterministically zeroes per-primitive outputs and [[primitive_id]] (M5 Pro / M6), and causes guilty_dm=1 MMU interrupts and
+// firmware-detected GPU lockups across M3 Pro, M4 Pro, M5 Max and M6 on macOS 26.6 and 27.2.x (Ocarina of Time #3274 / #3275). Whole Metal 4 mesh
+// pipelines (both compiled directly and reloaded from the archive via arch_lookup) keep full mesh state and run without hangs. Its depth / stencil
 // formats are not named (Metal 4 pipelines serve any). nil when a function has no Metal 4 descriptor (fn4_of: the diagnostic fragment overrides)
 static MTL4MeshRenderPipelineDescriptor *mtk_desc4(MTLRenderPipelineDescriptor *d, NvShader *ts, NvShader *ms, id<MTLFunction> ff, int border) {
     MTL4FunctionDescriptor *mf = fn4_of_b(ms->fn, !border), *of = ts ? fn4_of_b(ts->fn, !border) : fn4_of(ms->mesh_obj), *f4 = fn4_of_b(ff, !border);
@@ -869,6 +871,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
         RED_ONCE(150, "DrawMeshTasks without its task and mesh shaders (task %s mesh %s): draw skipped", ts ? ts->key : "-", ms ? ms->key : "-"); return; }
     if (ts && mtk_spill(ts) != (ms->mesh_payload > DMSH_MESH_PAYLOAD_MAX)) {
         RED_ONCE(175, "DrawMeshTasks task %s (%u-byte payload) and mesh %s (%u-byte payload) disagree on payload spill: draw skipped", ts->key, ts->mesh_payload, ms->key, ms->mesh_payload); return; }
+    ua_prepare_prog(pr, 1u << 3 | 1u << 4);
     image_prepare(pr, 1u << 3 | 1u << 4);
     if (g_nubd && (g_enc || ubd_lazy()) && ((ts && ubd_conflict_sh(ts, 3)) || ubd_conflict_sh(ms, 4))) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // as draw_ does for its stages
     NvProg *raster = pr->geo_lean_raster;   // the pixel stage alone
@@ -1418,7 +1421,7 @@ static void geo_draw_(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0, uint
             const uint8_t *p; op_hdr h; const void *a;
             while (op_next(&cur, &p, &h, &a) && p != g_geo_run[i].op) state_op(h.op, a);
         }
-        if (!ce) ce = enc_c_begin(NULL);
+        if (!ce) ce = enc_c_begin();
         geo_gs_one(ce, &g_geo_run[i]);
         if (g_geo_split_compute) { enc_c_end(ce); ce = nil; }
         packs += g_geo_run[i].emits != 0 && !g_geo_run[i].direct_count;
@@ -1427,7 +1430,7 @@ static void geo_draw_(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0, uint
     int legacy = geo_pack_legacy(), small = 0;
     for (int i = 0; i < n; i++) if (!legacy && g_geo_run[i].emits && !g_geo_run[i].direct_count && g_geo_run[i].groups <= 1024) small++;
     if (small) {
-        if (!ce) ce = enc_c_begin(NULL);
+        if (!ce) ce = enc_c_begin();
         else [ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
         enc_c_pso(ce, pack[3]);
         for (int i = 0; i < n; i++) if (g_geo_run[i].emits && !g_geo_run[i].direct_count && g_geo_run[i].groups <= 1024) {
@@ -1436,7 +1439,7 @@ static void geo_draw_(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0, uint
         if (g_geo_split_compute) { enc_c_end(ce); ce = nil; }
     }
     if (packs > small) for (int stage = 0; stage < 3; stage++) {
-        if (!ce) ce = enc_c_begin(NULL);
+        if (!ce) ce = enc_c_begin();
         else [ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
         enc_c_pso(ce, pack[stage == 1 && legacy ? 4 : stage]);
         for (int i = 0; i < n; i++) if (g_geo_run[i].emits && !g_geo_run[i].direct_count && (legacy || g_geo_run[i].groups > 1024)) {
@@ -1447,7 +1450,7 @@ static void geo_draw_(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0, uint
         if (g_geo_split_compute) { enc_c_end(ce); ce = nil; }
     }
     for (int i = 0; i < n; i++) if (g_geo_run[i].lean && !g_geo_run[i].direct_count) {
-        if (!ce) ce = enc_c_begin(NULL);
+        if (!ce) ce = enc_c_begin();
         else [ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
         enc_c_pso(ce, g_geo_lean_k[1]); enc_c_args(ce, g_geo_run[i].lean_job, 0);
         enc_c_dispatch(ce, MTLSizeMake((g_geo_run[i].packed_size / 4 + 63) / 64, 1, 1), MTLSizeMake(64, 1, 1));

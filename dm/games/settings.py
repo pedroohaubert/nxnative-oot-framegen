@@ -75,7 +75,7 @@ def build(gid, patched, control, other_programs=()):
         return macros[name].strip('"')
 
     def shown(cond, n):
-        if '&' in cond: return all(shown(c, n) for c in cond.split('&'))   # every condition (kid-with-sword-remake: a row hidden on one platform only)
+        if '&' in cond: return all(shown(c, n) for c in cond.split('&'))
         if cond == 'always': return True
         if cond == 'mac-mic': return mac_mic
         if cond == 'languages>1': return len(langs) > 1

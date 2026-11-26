@@ -27,11 +27,11 @@ zip_store	.zs:.bwav:.webm:.metallib
 # 256 MiB in front + 8 GiB heap + 256 MiB stacks + 8 GiB alias region. At 4 GiB the Chamber of Sages transition runs out of room for a 50.03 MiB address region (#3103, and kid-with-sword-remake L6.1).
 mem_reserve	0x420000000
 mem_alias	0x200000000
-# kid-with-sword-remake L6.1: no application-pool check on the guest's maps. At the Master Sword (an iPhone log of the white screen, L-series before L3): the game holds its
-# 6.2 GB heap, asks MapPhysicalMemory for 38 MB more as the cutscene starts, and is refused ("2.73 GB mapped, the application pool is full"); the SDK frees cached pages and
-# retries, the cutscene's AV1 decoder never opens, and the fade-in stays white for good. Without the check the map is made (with the 8 GB alias region above to hold it); the
-# guest's memory is in files on the iPhone (DM_GUEST_FILE), so pages it maps and does not touch cost nothing
-mem_map_limit	off
+# Horizon's application-pool limit (matches upstream/main): with mem_map_limit off (kid-with-sword-remake L6.1, an iPhone workaround for the Master Sword #2407 white screen),
+# svcGetInfo(UsedMemorySize) omits g_alias_mapped and svcMapPhysicalMemory never returns ResultLimitReached, so ares caches 5.25-6.25 GB of models (>2x Switch 2) and exhausts
+# the fixed 16 MiB gsys::ModelResourceMgr(GpuHeap) (16x1 MiB pools, shrunk to 0 free bytes by sead::ExpHeap::adjust() at boot), causing a null-pool BufferInitialize (0x3d0) crash
+# in Hyrule Field and ~3.3 GB of extra RAM on 16 GB Macs. Keep an eye on the iPhone Master Sword cutscene (#2407) with this back on.
+mem_map_limit	on
 mem_stack	0x10000000
 app_pool	0x240000000
 sys_resource	0x3000000

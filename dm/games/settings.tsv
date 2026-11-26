@@ -24,6 +24,7 @@ DM_WIDE_VIEW	toggle	-	1	fixups:WIDE_VIEW	Game	Wide View	Fills the whole iPhone s
 DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console Mode		level=basic
 DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	platform:mac	Game	Upscaling	Uses more GPU time and can increase heat.
 DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX	game	DM_GAME_UPSCALER_N!=0&platform:mac	Game	Game's Upscaler
+DM_NVN_ANISO	choice	0=Game default,2=2x,4=4x,8=8x,16=16x	0	platform:mac&gfxapi:nvn	Game	Texture filtering	Sharper ground and walls seen at an angle. 16x costs little on a Mac.
 DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game Language		level=basic
 DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display Mode		level=basic
 DM_PICTURE_FIT	choice	fit=Fit,fill=Fill	fit	platform:ios	Game	Picture	Fill crops the game's 16:9 picture to cover the screen. Health bars, subtitles or maps near the edges can be cut off. A full-screen picture without cropping needs a patch for each game.
