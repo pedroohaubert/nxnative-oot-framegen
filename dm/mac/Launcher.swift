@@ -767,14 +767,10 @@ struct LauncherView: View {
         VStack(spacing: 0) {
             cardTopBar(p)
                 .background(p.card)
-            Rectangle().fill(p.line).frame(height: TactileMetrics.hairline)
             cardContent(p)
                 .clipped()
             cardFooter(p)
                 .background(p.card)
-                .overlay(alignment: .top) {
-                    Rectangle().fill(p.line).frame(height: TactileMetrics.hairline)
-                }
         }
         .background(p.card, in: RoundedRectangle(cornerRadius: TactileMetrics.cardRadius, style: .continuous))
         .clipShape(RoundedRectangle(cornerRadius: TactileMetrics.cardRadius, style: .continuous))
@@ -813,6 +809,16 @@ struct LauncherView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .top) {
+            LinearGradient(colors: [p.card, p.card.opacity(0)], startPoint: .top, endPoint: .bottom)
+                .frame(height: 8)
+                .allowsHitTesting(false)
+        }
+        .overlay(alignment: .bottom) {
+            LinearGradient(colors: [p.card.opacity(0), p.card], startPoint: .top, endPoint: .bottom)
+                .frame(height: 18)
+                .allowsHitTesting(false)
+        }
     }
 
     private func essentialsBody(_ p: TactilePalette) -> some View {
