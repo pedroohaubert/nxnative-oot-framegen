@@ -6,13 +6,15 @@ func checkLauncherLayout(_ model: LauncherModel, defaults: UserDefaults) -> Int 
     NSApplication.shared.setActivationPolicy(.prohibited)
     var failed = 0
     func expect(_ c: Bool, _ what: String) { print((c ? "PASS " : "FAIL ") + what); if !c { failed += 1 } }
-    for size in [NSSize(width: 860, height: 500), NSSize(width: 1120, height: 640)] {
-        autoreleasepool {
-            let view = NSHostingView(rootView: LauncherView(m: model, done: { _ in }).defaultAppStorage(defaults))
-            view.frame = NSRect(origin: .zero, size: size)
-            view.layoutSubtreeIfNeeded()
-            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
-            expect(view.frame.width >= 860 && view.frame.height >= 500, "launcher view lays out at \(Int(size.width))x\(Int(size.height))")
+    for size in [NSSize(width: 480, height: 480), NSSize(width: 520, height: 564)] {
+        for tab in [LauncherTab.essentials, LauncherTab.advanced] {
+            autoreleasepool {
+                let view = NSHostingView(rootView: LauncherView(m: model, done: { _ in }, initialTab: tab).defaultAppStorage(defaults))
+                view.frame = NSRect(origin: .zero, size: size)
+                view.layoutSubtreeIfNeeded()
+                RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                expect(view.frame.width >= 480 && view.frame.height >= 480, "launcher \(tab.rawValue) view lays out at \(Int(size.width))x\(Int(size.height))")
+            }
         }
     }
     let visible = NSRect(x: -1920, y: 40, width: 1920, height: 900)
