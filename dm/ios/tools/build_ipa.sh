@@ -310,7 +310,7 @@ elif [ -f "$ROMFS" ]; then MAPS=("$P/romfs.img=$ROMFS"); else MAPS=("$P/romfs=$R
 if [ -n "$AOC" ] && [ -d "$AOC" ]; then MAPS+=("$P/aoc=$AOC"); t "add-on content: $(ls "$AOC" | tr '\n' ' ')"; fi
 if [ -n "${PSO:-}" ]; then MAPS+=("$P/pso=$PSO"); fi
 MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "$P=$APP")
-if [ "$GFXAPI" = nvn ] && [ -s "$GD/gl_capture.tsv" ]; then MAPS+=("$P/msl/gl=$MSL_IOS/gl"); fi
+if [ "${GFXAPI:-}" = nvn ] && [ -n "${GD:-}" ] && [ -s "$GD/gl_capture.tsv" ]; then MAPS+=("$P/msl/gl=$MSL_IOS/gl"); fi
 # Amiibo (a profile with amiibo.tsv: Ocarina of Time's in-game Amiibo menu, GameMenu.swift): the app's romfs_overlay holds that list and, with the profile's amiibo_overlay on, the
 # game's own Game/AmiiboSetting with every amiibo's daily limit off, made here from the player's RomFS image (scripts/oot_amiibo_overlay.py; nothing of the game is in the repository).
 # main.m serves it over the RomFS (DM_ROMFS_OVERLAY, hle_fs.c rom_overlay_expand) and points DM_AMIIBO at Documents/amiibo.txt. A folder of its own, so no other replacement is packed

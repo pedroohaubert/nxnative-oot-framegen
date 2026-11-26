@@ -311,11 +311,16 @@ class RtCompile(unittest.TestCase):
                 (old / name).write_text('old artifact')
             new_rt = out / 'rt_library_b.json'
             new_rt.write_text('new catalog')
-            store = SimpleNamespace(names=lambda prefix: [], delete_prefix=Mock())
+            store = SimpleNamespace(names=lambda prefix: [], blob_ids=lambda prefix: {}, delete_prefix=Mock())
             writer = Mock()
+            fake_romfs = SimpleNamespace(Image=lambda d: SimpleNamespace(
+                children=lambda _: [(p.name, p.name) for p in sorted(d.iterdir())],
+                entry=lambda k: (0, 0),
+            ))
             env = lift('owned_output', 'publish_library', want={'a' * 16}, dmsh_rt_compile=rt,
                        label_dir=lambda label: str(out), STAGE='stage/test',
                        shader_lib=SimpleNamespace(image_of=lambda d: d + '.img', write=writer),
+                       romfs=fake_romfs,
                        OLD_IMAGE={'mac': old}, OUT_KEY=re.compile(r'([0-9a-f]{16}|rt_library)_b'),
                        dmsh_chain=SimpleNamespace(STAMP='inputs.tsv'), STAMP_BEFORE='same', INPUTS='same',
                        STORE=store, os=os, shutil=shutil)
