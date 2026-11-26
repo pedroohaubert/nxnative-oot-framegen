@@ -194,7 +194,6 @@ private enum TactileMetrics {
     static let minHeight: CGFloat = 480
     static let cardRadius: CGFloat = 10
     static let controlRadius: CGFloat = 6
-    static let keyChipRadius: CGFloat = 4
     static let hairline: CGFloat = 0.5
 }
 
@@ -632,7 +631,7 @@ struct LauncherView: View {
         let excluded = essentialEnvs
         var order: [String] = []
         var grouped: [String: [Setting]] = [:]
-        for s in m.settings where !excluded.contains(s.env) && m.visible(s) {
+        for s in m.settings where !excluded.contains(s.env) && (m.visible(s) || s.env == "DM_FRAMEGEN") {
             let key = s.sectionTitle
             if grouped[key] == nil { order.append(key) }
             grouped[key, default: []].append(s)
@@ -907,12 +906,11 @@ struct LauncherView: View {
                     .buttonStyle(TactileButtonStyle(.secondary))
 
                 Button(action: start) {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 6) {
                         Text("Play")
                         Image(systemName: "return")
-                            .font(.system(size: 9.5, weight: .medium))
-                            .frame(width: 18, height: 18)
-                            .background(p.primaryFg.opacity(0.14), in: RoundedRectangle(cornerRadius: TactileMetrics.keyChipRadius, style: .continuous))
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(p.primaryFg.opacity(0.75))
                     }
                 }
                 .buttonStyle(TactileButtonStyle(.primary))
